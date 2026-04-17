@@ -122,6 +122,10 @@ app.add_middleware(
 # API Routes
 # ============================================================================
 
+from backend.routers import automation
+
+app.include_router(automation.router, prefix="/api/action", tags=["Automation"])
+
 @app.get("/", tags=["Health"])
 async def root():
     """服务健康检查"""

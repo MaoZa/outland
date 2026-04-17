@@ -5,8 +5,8 @@ services:
     image: redroid/redroid:11.0.0-latest
     container_name: outland-redroid
     privileged: true
-    ports:
-      - "5555:5555"  # ADB port
+#    ports:
+#      - "5555:5555"  # ADB port
     # Redroid 启动参数通过 command 传递（模拟内核启动参数）
     command:
       - androidboot.redroid_width=720

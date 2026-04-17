@@ -7,3 +7,9 @@ docker>=7.0.0
 
 # Data Validation
 pydantic>=2.5.0
+
+# ADB Async Control (adb-shell with async support)
+adb-shell[async]>=0.4.4
+
+# Cryptography for RSA key generation
+cryptography>=42.0.0
