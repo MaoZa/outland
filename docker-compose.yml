@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  redroid:
+    image: redroid/redroid:11.0.0-latest
+    container_name: outland-redroid
+    privileged: true
+    ports:
+      - "5555:5555"  # ADB port
+    # Redroid 启动参数通过 command 传递（模拟内核启动参数）
+    command:
+      - androidboot.redroid_width=720
+      - androidboot.redroid_height=1280
+      - androidboot.redroid_fps=30
+      - androidboot.redroid_gpu_mode=guest  # 无 GPU 服务器必加：强制软件渲染
+    # 网络配置
+    network_mode: host
+    # 存储卷（可选：持久化数据）
+    # volumes:
+    #   - redroid_data:/data
+    # 资源限制
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2G
+    # 重启策略
+    restart: unless-stopped
+
+# volumes:
+#   redroid_data:
