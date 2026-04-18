@@ -1,0 +1,65 @@
+# Outland - Redroid 远程部署文件
+# 部署到 Ubuntu 服务器上，为后端提供 Android 云容器服务
+#
+# 使用方法：
+#   1. 将 agent/ 目录和此文件上传到 Ubuntu 服务器
+#   2. 确保内核支持 binder: modprobe binder_linux devices="binder,hwbinder,vndbinder"
+#   3. 启动: docker compose -f docker-compose.redroid.yml up -d --build
+
+version: '3.8'
+
+services:
+  # ============================================
+  # Outland Agent - 远程 Docker 代理
+  # 供后端通过 HTTP 查询和管理容器
+  # ============================================
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: outland-agent
+    ports:
+      - "9090:9090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  # ============================================
+  # ADB Proxy Service
+  # 与 Redroid 共享网络命名空间
+  # ============================================
+  adb-proxy:
+    image: alpine:latest
+    container_name: outland-adb-proxy
+    command:
+      - sh
+      - -c
+      - |
+        sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+        apk add --no-cache android-tools
+        adb -a -P 5037 server nodaemon &
+        while true; do
+          nc -z 127.0.0.1 5555 && adb connect 127.0.0.1:5555 || true
+          sleep 5
+        done
+    depends_on:
+      - redroid
+    network_mode: service:redroid
+    restart: unless-stopped
+
+  # ============================================
+  # Redroid 安卓容器
+  # ============================================
+  redroid:
+    image: redroid/redroid:11.0.0-latest
+    container_name: outland-redroid
+    privileged: true
+    ports:
+      - "5555:5555"  # ADB 直连端口
+      - "5037:5037"  # ADB Server 代理端口
+    command:
+      - androidboot.redroid_width=720
+      - androidboot.redroid_height=1280
+      - androidboot.redroid_fps=30
+      - androidboot.redroid_gpu_mode=guest
+    restart: unless-stopped

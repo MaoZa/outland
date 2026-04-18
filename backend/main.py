@@ -91,6 +91,10 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown: 清理资源
     print("[Outland] Backend shutting down...")
+    
+    # 关闭 WebRTC 管理器，释放所有连接和子进程
+    from backend.services.webrtc_manager import shutdown_webrtc_manager
+    await shutdown_webrtc_manager()
 
 
 app = FastAPI(
@@ -122,9 +126,11 @@ app.add_middleware(
 # API Routes
 # ============================================================================
 
-from backend.routers import automation
+from backend.routers import automation, stream
+from backend.services.webrtc_manager import shutdown_webrtc_manager
 
 app.include_router(automation.router, prefix="/api/action", tags=["Automation"])
+app.include_router(stream.router, prefix="/api/stream", tags=["Stream"])
 
 @app.get("/", tags=["Health"])
 async def root():
@@ -158,34 +164,47 @@ async def health_check():
 )
 async def list_instances():
     """
-    获取当前宿主机上运行的 Redroid 容器列表。
+    获取 Redroid 容器列表。
     
-    返回所有 Redroid 镜像的容器及其状态信息，包括：
-    - 容器名称、ID、运行状态
-    - 端口映射信息
-    - 创建时间
-    
-    Returns:
-        InstanceListResponse: 包含容器总数和实例列表
-        
-    Raises:
-        HTTPException 500: Docker 服务未启动或权限不足
+    优先通过远程 Agent 获取（远程部署模式），
+    否则回退到本地 Docker Socket 查询。
     """
+    import os
+    import httpx
+    
+    agent_url = os.environ.get("AGENT_URL")
+    
+    # ---- 远程 Agent 模式 ----
+    if agent_url:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{agent_url}/api/instances")
+                resp.raise_for_status()
+                data = resp.json()
+                return InstanceListResponse(**data)
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=f"Agent 返回错误: {e.response.text}"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"无法连接远程 Agent ({agent_url}): {str(e)}"
+            )
+    
+    # ---- 本地 Docker 模式（回退） ----
     try:
         client = get_docker_client()
-        
-        # 过滤 redroid 相关的容器
-        # 支持的镜像名模式：redroid/redroid:*、redroid/*
         all_containers = client.containers.list(all=True)
-        
+
         redroid_containers = [
             c for c in all_containers
             if any("redroid" in tag.lower() for tag in c.image.tags)
         ]
-        
+
         instances = []
         for container in redroid_containers:
-            # 获取端口映射
             ports = []
             if container.ports:
                 for container_port, host_bindings in container.ports.items():
@@ -197,7 +216,7 @@ async def list_instances():
                                 host_port=int(binding.get("HostPort", 0)),
                                 protocol=port_parts[1] if len(port_parts) > 1 else "tcp"
                             ))
-            
+
             instances.append(ContainerInfo(
                 name=container.name,
                 id=container.short_id,
@@ -207,12 +226,12 @@ async def list_instances():
                 ports=ports,
                 created_at=container.attrs.get("Created", "unknown")
             ))
-        
+
         return InstanceListResponse(
             total=len(instances),
             instances=instances
         )
-        
+
     except docker.errors.DockerException as e:
         raise HTTPException(
             status_code=500,

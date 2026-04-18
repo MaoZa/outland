@@ -38,6 +38,10 @@ ADB_CONNECT_TIMEOUT: float = 10.0
 # ADB Shell 执行超时时间（秒）
 ADB_SHELL_TIMEOUT: float = 5.0
 
+# Redroid 主机名（支持远程部署，从环境变量读取）
+import os as _os
+REDRoid_HOST: str = _os.environ.get("REDROID_HOST", "redroid")
+
 
 # ============================================================================
 # ADB 设备异常类
@@ -91,9 +95,8 @@ class AdbManager:
         self._devices: Dict[str, AdbDeviceTcpAsync] = {}
         self._locks: Dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
         
-        # 自动生成 RSA 密钥对（内存中，不持久化）
-        self._rsa_signer = PythonRSASigner(None, None)
-        self._rsa_signer.generate()
+        # 暂时不使用 RSA 认证，跳过初始化
+        # self._rsa_signer = None
         
         self._initialized = True
     
@@ -222,10 +225,9 @@ class AdbManager:
             
             device = AdbDeviceTcpAsync(host_ip, host_port)
             
-            # 使用 RSA 认证建立连接
+            # 跳过 RSA 认证，直接连接
             await device.connect(
-                auth_timeout_ms=int(ADB_CONNECT_TIMEOUT * 1000),
-                rsa_keys=[self._rsa_signer]
+                auth_timeout_ms=int(ADB_CONNECT_TIMEOUT * 1000)
             )
             
             # 缓存连接
@@ -250,16 +252,29 @@ class AdbManager:
     def _get_container_adb_port(self, container_id: str) -> int:
         """
         获取容器内部 5555/tcp 端口在宿主机上映射的实际端口
-        
-        Args:
-            container_id: Docker 容器 ID 或名称
-            
-        Returns:
-            int: 宿主机上映射的外部端口
-            
-        Raises:
-            HTTPException: 无法找到端口映射
+        优先通过远程 Agent 查询，否则回退本地 Docker。
         """
+        import os
+        agent_url = os.environ.get("AGENT_URL")
+        
+        # ---- 远程 Agent 模式 ----
+        if agent_url:
+            import httpx
+            try:
+                resp = httpx.get(
+                    f"{agent_url}/api/container/{container_id}/adb_port",
+                    timeout=10.0
+                )
+                resp.raise_for_status()
+                return resp.json()["port"]
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    raise HTTPException(status_code=404, detail=f"容器 {container_id} 不存在")
+                raise HTTPException(status_code=502, detail=f"Agent 返回错误: {e.response.text}")
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"无法连接 Agent: {str(e)}")
+        
+        # ---- 本地 Docker 模式 ----
         try:
             client = docker.from_env()
             container = client.containers.get(container_id)
@@ -272,49 +287,46 @@ class AdbManager:
                 if host_bindings and len(host_bindings) > 0:
                     return int(host_bindings[0]["HostPort"])
             
-            # 如果没有找到端口映射，可能是端口直接暴露
             raise HTTPException(
                 status_code=500,
                 detail=f"容器 {container_id} 未暴露 {REDRoid_ADB_PORT}/tcp 端口"
             )
             
         except docker.errors.NotFound:
-            raise HTTPException(
-                status_code=404,
-                detail=f"容器 {container_id} 不存在"
-            )
+            raise HTTPException(status_code=404, detail=f"容器 {container_id} 不存在")
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"获取容器端口映射失败: {str(e)}"
-            )
+            raise HTTPException(status_code=500, detail=f"获取容器端口映射失败: {str(e)}")
     
     def _get_host_ip(self) -> str:
         """
         获取宿主机的 IP 地址
-        
-        Returns:
-            str: 宿主机 IP 地址
         """
-        # 使用 Docker 网关 IP 或回环地址
-        try:
-            client = docker.from_env()
-            info = client.info()
-            # 尝试获取 Docker 网关
-            if "DockerRootDir" in info:
-                # 创建临时容器获取网关
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                host_ip = s.getsockname()[0]
-                s.close()
-                return host_ip
-        except Exception:
-            pass
+        import os
+        # 如果在 Docker 中运行，宿主机的映射端口可以通过 Docker 默认网关访问
+        if os.path.exists("/.dockerenv"):
+            try:
+                import socket, struct
+                with open("/proc/net/route") as fh:
+                    for line in fh:
+                        fields = line.strip().split()
+                        if fields[1] != '00000000' or not int(fields[3], 16) & 2:
+                            continue
+                        return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+            except Exception:
+                return "host.docker.internal"
         
-        return "127.0.0.1"
+        # 兜底：本地原生运行时
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            host_ip = s.getsockname()[0]
+            s.close()
+            return host_ip
+        except Exception:
+            return "127.0.0.1"
     
     async def _execute(self, container_id: str, command: str) -> str:
         """

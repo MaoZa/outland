@@ -13,3 +13,12 @@ adb-shell[async]>=0.4.4
 
 # Cryptography for RSA key generation
 cryptography>=42.0.0
+
+# WebRTC Support (aiortc for WebRTC peer connection)
+aiortc>=0.9.0
+
+# Video/Audio Processing (PyAV for H264 decoding)
+av>=10.0.0
+
+# HTTP Client (for remote Agent API calls)
+httpx>=0.25.0
