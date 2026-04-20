@@ -1,26 +1,32 @@
 """
 Outland Agent - WebRTC Manager
 
-提供 WebRTC 连接管理，处理视频推流和控制信令。
+Provides WebRTC connection management, handles video streaming and control signaling.
 
-核心功能：
-- 管理每个容器的 WebRTC 连接集合
-- 处理 SDP Offer/Answer 交换
-- 通过 DataChannel 接收控制指令并转发到 AdbManager
+Core Features:
+- Manage WebRTC connection collections for each container
+- Handle SDP Offer/Answer exchange
+- Receive control commands via DataChannel and forward to AdbManager
 
-技术要点：
-- 使用 STUN 服务器配置解决公网 NAT 穿透问题（可选）
-- DataChannel 回调中使用 asyncio.create_task() 调用异步 AdbManager 方法
-- 一个容器可被多个客户端同时观看
+Technical Notes:
+- Use STUN server configuration to get srflx candidates
+- Control commands execute concurrently without serial queue (eliminates latency accumulation)
+- Video resolution pre-cached from ScrcpyTrack to AdbManager, avoids wm size calls
 
-部署说明：
-- Agent 使用 network_mode: "host" 确保 UDP 媒体流顺利打通
-- 本地部署时不需要 STUN 服务器
+Deployment Notes:
+- Agent must use network_mode: "host" to ensure UDP media streams work properly
+- Use Xiaomi and Bilibili STUN servers to solve domestic network NAT traversal issues
 """
 
 import asyncio
 import json
+import logging
+import os
+import sys
+import traceback as tb_module
 from typing import Dict, Set, Optional
+
+logger = logging.getLogger(__name__)
 
 from aiortc import (
     RTCPeerConnection,
@@ -34,34 +40,62 @@ from aiortc.contrib.media import MediaRelay
 from fastapi import HTTPException
 
 from services.adb_client import get_adb_manager, AdbManager
+from services.scrcpy_track import ScrcpyTrack, VideoQualityLevel
+
+
+# ============================================================================
+# STUN Server Configuration
+# ============================================================================
+
+DEFAULT_STUN_SERVERS = [
+    "stun:stun.miwifi.com:3478",
+    "stun:stun.chat.bilibili.com:3478"
+]
+
+def get_stun_servers() -> list[str]:
+    """
+    Get STUN servers from environment variable or use defaults.
+
+    Environment Variable:
+        STUN_SERVERS: comma-separated list of STUN server URLs
+                      Example: "stun:stun.example.com:3478,stun:stun2.example.com:3478"
+
+    Returns:
+        List of STUN server URLs
+    """
+    stun_env = os.environ.get("STUN_SERVERS", "")
+    if not stun_env:
+        return DEFAULT_STUN_SERVERS
+    return [s.strip() for s in stun_env.split(",") if s.strip()]
 
 
 # ============================================================================
 # AIORTC / AIOICE Monkey Patch
 # ============================================================================
-# 修复 Linux Docker 下 ifaddr 获取物理网卡失败导致 UDP 无法绑定的致命 Bug
+# Fix critical bug where ifaddr fails to get physical network card causing UDP binding failure in Linux Docker
 # 
-# 问题原因：
-# aioice 库使用 ifaddr.get_adapters() 获取本地 IP，但 Docker 容器中可能无法
-# 正确获取物理网卡的 IP（返回空列表），导致 UDP Socket 无法绑定，无 candidate 生成。
+# Root cause:
+# The aioice library uses ifaddr.get_adapters() to get local IP, but Docker containers may fail to
+# correctly get the physical network card IP (returns empty list), causing UDP Socket binding failure
+# and no candidate generation.
 #
-# 修复方案：
-# Patch aioice.ice.get_host_addresses 函数，在原有地址列表为空时添加 "0.0.0.0"
-# 作为 fallback，使 aiortc 能在全网卡成功建立 UDP Socket 绑定。
+# Fix:
+# Patch aioice.ice.get_host_addresses function, add "0.0.0.0" as fallback when address list is empty
+# to allow aiortc to successfully establish UDP Socket binding on all network cards.
 import aioice.ice
 _original_get_host_addresses = aioice.ice.get_host_addresses
 
 def patched_get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
     """
-    获取本地 IP 地址列表，修复 Docker 容器中 ifaddr 获取失败的问题。
+    Get local IP address list, fix ifaddr failure in Docker containers.
     
-    当 ifaddr 无法获取物理网卡 IP 时，添加 "0.0.0.0" 作为 fallback，
-    使 aiortc 能成功创建 UDP Socket 并生成 ICE candidates。
+    When ifaddr fails to get physical network card IP, add "0.0.0.0" as fallback,
+    allowing aiortc to successfully create UDP Socket and generate ICE candidates.
     """
     addresses = _original_get_host_addresses(use_ipv4, use_ipv6)
-    if not addresses:
-        # 关键修复：当 ifaddr 返回空列表时，添加 "0.0.0.0" fallback
-        # 这样 aiortc 能在全网卡绑定 UDP Socket，保证 ICE candidates 生成
+    # Always add "0.0.0.0" to ensure aiortc can listen on all interfaces
+    # This way, even if Docker assigns an internal IP, frontend can connect via STUN/srflx candidate
+    if "0.0.0.0" not in addresses:
         addresses.append("0.0.0.0")
     return addresses
 
@@ -70,38 +104,264 @@ aioice.ice.get_host_addresses = patched_get_host_addresses
 
 class WebRTCManager:
     """
-    WebRTC 连接管理器
+    WebRTC connection manager
     
-    负责管理与所有容器的 WebRTC 连接，支持视频推流和控制信令。
+    Manages WebRTC connections with all containers, supports video streaming and control signaling.
     
     Attributes:
-        _connections: 记录每个 container_id 对应的 RTCPeerConnection 集合
-        _relay: MediaRelay 用于复用视频流到多个客户端
+        _connections: Records set of RTCPeerConnection for each container_id
+        _relay: MediaRelay for multiplexing single video stream to multiple clients
+    
+    Performance Optimization:
+    - Control commands execute concurrently using asyncio.create_task()
+    - No serial queue, commands don't wait for previous one to complete
+    - Video resolution pre-cached from ScrcpyTrack to AdbManager
     """
     
     def __init__(self) -> None:
         """
-        初始化 WebRTC 管理器
+        Initialize WebRTC manager
         """
         # connections[container_id] = set of RTCPeerConnection
         self._connections: Dict[str, Set[RTCPeerConnection]] = {}
-        # MediaRelay 用于将单个视频流转发给多个客户端
+        # MediaRelay for forwarding single video stream to multiple clients
         self._relay = MediaRelay()
-        # 容器到 ScrcpyTrack 的映射（每个容器只有一个源）
+        # Container to ScrcpyTrack mapping (only one source per container)
         self._tracks: Dict[str, MediaStreamTrack] = {}
-        # AdbManager 实例
+        # AdbManager instance
         self._adb_manager: Optional[AdbManager] = None
     
     def _get_adb_manager(self) -> AdbManager:
         """
-        获取 AdbManager 实例（懒加载）
+        Get AdbManager instance (lazy loading)
         
         Returns:
-            AdbManager: ADB 管理器实例
+            AdbManager: ADB manager instance
         """
         if self._adb_manager is None:
             self._adb_manager = get_adb_manager()
         return self._adb_manager
+    
+    # =========================================================================
+    # Control Command Execution (Concurrent Mode, No Queue)
+    # =========================================================================
+    
+    async def _exec_click(self, adb_manager: AdbManager, container_id: str, data: dict) -> None:
+        """Execute click command"""
+        try:
+            await adb_manager.tap_with_conversion(
+                container_id,
+                data["x"],
+                data["y"],
+                data.get("video_width", 720),
+                data.get("video_height", 1280)
+            )
+        except Exception as e:
+            logger.error("[WebRTC] click execution failed: %s", e)
+    
+    async def _exec_swipe(self, adb_manager: AdbManager, container_id: str, data: dict) -> None:
+        """Execute swipe command"""
+        try:
+            await adb_manager.swipe_with_conversion(
+                container_id,
+                data["x1"],
+                data["y1"],
+                data["x2"],
+                data["y2"],
+                data.get("duration", 300),
+                data.get("video_width", 720),
+                data.get("video_height", 1280)
+            )
+        except Exception as e:
+            logger.error("[WebRTC] swipe execution failed: %s", e)
+    
+    async def _exec_input(self, adb_manager: AdbManager, container_id: str, data: dict) -> None:
+        """Execute text input command"""
+        try:
+            await adb_manager.input_text(container_id, data["text"])
+        except Exception as e:
+            logger.error("[WebRTC] input execution failed: %s", e)
+    
+    async def _exec_keyevent(self, adb_manager: AdbManager, container_id: str, data: dict) -> None:
+        """Execute key event command"""
+        try:
+            await adb_manager.keyevent(container_id, data["keycode"])
+        except Exception as e:
+            logger.error("[WebRTC] keyevent execution failed: %s", e)
+    
+    async def _exec_long_press(self, adb_manager: AdbManager, container_id: str, data: dict) -> None:
+        """Execute long press command"""
+        try:
+            await adb_manager.long_press(
+                container_id,
+                data["x"],
+                data["y"],
+                data.get("video_width", 720),
+                data.get("video_height", 1280)
+            )
+        except Exception as e:
+            logger.error("[WebRTC] long_press execution failed: %s", e)
+    
+    # =========================================================================
+    # SDP Processing
+    # =========================================================================
+    
+    def _add_video_mline_to_sdp(self, sdp: str) -> str:
+        """
+        Add video m-line to Safari SDP
+        
+        Safari's Offer may only contain DataChannel (application m-line),
+        without video track (m=video). aiortc needs video m-line to negotiate video codec correctly.
+        
+        This method inserts a standards-compliant video m-line into the SDP,
+        so aiortc can correctly create Answer with video track.
+        
+        Args:
+            sdp: Original SDP string
+            
+        Returns:
+            str: SDP string with video m-line added
+        """
+        lines = sdp.split('\r\n')
+        
+        # Extract ICE authentication info from original SDP
+        ice_ufrag = ""
+        ice_pwd = ""
+        ice_options = ""
+        fingerprint = ""
+        
+        for line in lines:
+            if line.startswith("a=ice-ufrag:"):
+                ice_ufrag = line
+            elif line.startswith("a=ice-pwd:"):
+                ice_pwd = line
+            elif line.startswith("a=ice-options:"):
+                ice_options = line
+            elif line.startswith("a=fingerprint:"):
+                fingerprint = line
+        
+        logger.debug("[WebRTC] Extracted ICE info: ufrag=%s...", ice_ufrag[:30] if ice_ufrag else 'None')
+        
+        # Video m-line template - must include ICE authentication info
+        # Use H264 as video codec (good compatibility)
+        # mid uses "1" because mid:0 in original SDP is DataChannel
+        # Note: Simplified parameters, let aiortc auto-negotiate codec
+        video_mline_parts = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 120",
+            "c=IN IP4 0.0.0.0",
+            "a=mid:1",
+            "a=recvonly",
+            "a=rtcp-mux",
+            "a=rtcp-rsize",
+            # H264 basic config, don't specify fmtp parameters, let aiortc auto-negotiate
+            "a=rtpmap:120 H264/90000",
+        ]
+        
+        # Add ICE authentication info (copied from original SDP)
+        if ice_ufrag:
+            video_mline_parts.append(ice_ufrag)
+        if ice_pwd:
+            video_mline_parts.append(ice_pwd)
+        if ice_options:
+            video_mline_parts.append(ice_options)
+        if fingerprint:
+            video_mline_parts.append(fingerprint)
+            video_mline_parts.append("a=setup:actpass")  # Safari uses actpass
+        
+        video_mline = "\r\n".join(video_mline_parts) + "\r\n"
+        
+        # Insert video m-line before first m= line
+        new_lines = []
+        inserted = False
+        
+        for line in lines:
+            # Insert video m-line before first m= line
+            if not inserted and line.startswith('m='):
+                new_lines.append(video_mline)
+                inserted = True
+            
+            new_lines.append(line)
+        
+        # If no m= line found (insert at beginning)
+        if not inserted:
+            new_lines.insert(0, video_mline)
+        
+        result = '\r\n'.join(new_lines)
+        logger.debug("[WebRTC] SDP after adding video m-line:\n%s", result[:600])
+        return result
+    
+    def _sanitize_remote_description(self, pc: RTCPeerConnection) -> None:
+        """
+        Clean incompatible parameters from Safari SDP
+        
+        Safari's SDP Offer may contain parameters not fully supported by aiortc,
+        such as certain rtcp-fb types or fmtp parameters. These parameters cause
+        "None is not in list" error during createAnswer.
+        
+        Solution: Modify the parameter list in pc._remote_description object,
+        remove incompatible parameters.
+        
+        Args:
+            pc: RTCPeerConnection instance
+        """
+        try:
+            # Get current remote description
+            remote_desc = pc.remoteDescription
+            if not remote_desc or not remote_desc.sdp:
+                logger.debug("[WebRTC] No remote description, no need to clean")
+                return
+            
+            logger.debug("[WebRTC] Original SDP first 500 chars:\n%s", remote_desc.sdp[:500])
+            
+            sdp_lines = remote_desc.sdp.split('\r\n')
+            cleaned_lines = []
+            removed_count = 0
+            
+            for line in sdp_lines:
+                should_remove = False
+                
+                # Skip rtcp-fb lines containing aiortc unsupported parameters
+                if line.startswith('a=rtcp-fb:'):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        payload_type = parts[1]
+                        if payload_type == '*':
+                            fb_type = parts[2] if len(parts) > 2 else ""
+                        if fb_type in ['goog-remb', 'transport-cc', 'ccm', 'fir']:
+                            logger.debug("[WebRTC] Removed Safari-specific rtcp-fb: %s", line)
+                            should_remove = True
+                            removed_count += 1
+                
+                # Simplify fmtp parameters
+                if line.startswith('a=fmtp:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        payload = parts[1]
+                        logger.debug("[WebRTC] Simplified fmtp parameter: %s", line)
+                        cleaned_lines.append(f"a=fmtp:{payload}")
+                        removed_count += 1
+                        continue
+                
+                if not should_remove:
+                    cleaned_lines.append(line)
+            
+            # If modified, reset remote description
+            cleaned_sdp = '\r\n'.join(cleaned_lines)
+            if cleaned_sdp != remote_desc.sdp:
+                logger.info("[WebRTC] SDP cleaned, removed %d lines, resetting remote description", removed_count)
+                pc._remote_description = RTCSessionDescription(
+                    sdp=cleaned_sdp,
+                    type=remote_desc.type
+                )
+            else:
+                logger.debug("[WebRTC] SDP doesn't need cleaning")
+                
+        except Exception as e:
+            logger.warning("[WebRTC] Error during SDP cleaning (ignored): %s", e)
+    
+    # =========================================================================
+    # WebRTC Connection Handling
+    # =========================================================================
     
     async def handle_offer(
         self,
@@ -110,95 +370,129 @@ class WebRTCManager:
         offer_type: str = "offer"
     ) -> RTCSessionDescription:
         """
-        处理 WebRTC Offer 并返回 Answer
+        Handle WebRTC Offer and return Answer
         
-        创建 RTCPeerConnection，配置 STUN 服务器（可选），添加视频轨道，
-        设置控制信令通道，并生成 SDP Answer。
+        Create RTCPeerConnection, configure STUN server (optional), add video track,
+        set control signaling channel, and generate SDP Answer.
         
         Args:
-            container_id: Docker 容器 ID
-            sdp: SDP Offer 字符串
-            offer_type: SDP 类型，默认 "offer"
+            container_id: Docker container ID
+            sdp: SDP Offer string
+            offer_type: SDP type, default "offer"
             
         Returns:
-            RTCSessionDescription: 包含 SDP Answer
+            RTCSessionDescription: Contains SDP Answer
             
         Raises:
-            HTTPException: 连接建立失败
+            HTTPException: Connection establishment failed
         """
         pc = None
         try:
-            print(f"[WebRTC] 开始处理 Offer，container_id: {container_id}")
+            logger.info("[WebRTC] Starting to process Offer, container_id: %s", container_id)
+            logger.debug("[WebRTC] SDP Offer type: %s, SDP length: %d", offer_type, len(sdp) if sdp else 0)
             
-            # 获取容器的 ADB 端口
+            # Validate SDP
+            if not sdp or not isinstance(sdp, str):
+                raise ValueError(f"Invalid SDP: {sdp!r}")
+            
+            # Get container's ADB port
             adb_manager = self._get_adb_manager()
-            print(f"[WebRTC] 获取到 AdbManager")
+            logger.debug("[WebRTC] Got AdbManager")
             
             adb_port = adb_manager._get_container_adb_port(container_id)
-            print(f"[WebRTC] 获取到 ADB 端口: {adb_port}")
+            logger.debug("[WebRTC] Got ADB port: %d", adb_port)
             
-            # 必须使用国内可用的 STUN 服务器！
-            # 否则 Ubuntu Docker(host模式) 下 aiortc 会因为找不到默认路由引发 bug，导致一条 a=candidate 都不生成。
-            # 这里使用了小米和 B 站的免费开源 STUN 服务器，完美解决国内网络不通和 ICE 为空的问题。
+            # Must use domestically accessible STUN servers
+            # Optimization: Configure RTCPeerConnection low latency parameters
+            stun_servers = get_stun_servers()
             pc = RTCPeerConnection(
                 configuration=RTCConfiguration(
                     iceServers=[
-                        RTCIceServer(urls=["stun:stun.miwifi.com:3478"]),
-                        RTCIceServer(urls=["stun:stun.chat.bilibili.com:3478"])
-                    ]
+                        RTCIceServer(urls=[server]) for server in stun_servers
+                    ],
                 )
             )
             
-            # 初始化连接记录
+            # Initialize connection record
             if container_id not in self._connections:
                 self._connections[container_id] = set()
             self._connections[container_id].add(pc)
             
-            # 导入 ScrcpyTrack（延迟导入避免循环依赖）
+            # Import ScrcpyTrack (lazy import to avoid circular dependency)
             from services.scrcpy_track import ScrcpyTrack
             
-            # 创建视频轨道（如果还没有为这个容器创建）
+            # Create video track (if not already created for this container)
             if container_id not in self._tracks:
-                print(f"[WebRTC] 正在为容器 {container_id} 创建 ScrcpyTrack (ADB端口: {adb_port})...")
-                # 创建 ScrcpyTrack 实例并异步启动 scrcpy
+                logger.info("[WebRTC] Creating ScrcpyTrack for container %s (ADB port: %d)...", container_id, adb_port)
+                # Create ScrcpyTrack instance and start scrcpy asynchronously
                 track = ScrcpyTrack(container_id, adb_port)
                 await track._start_scrcpy_async()
                 self._tracks[container_id] = track
-                print(f"[WebRTC] ScrcpyTrack 创建成功")
+                
+                # Get actual physical screen resolution and cache, avoid subsequent wm size calls
+                # Note: Must use get_screen_size() to get physical resolution (e.g., 720x1280),
+                # not video resolution (e.g., 408x720), because coordinate conversion needs physical resolution
+                screen_w, screen_h = await adb_manager.get_screen_size(container_id)
+                adb_manager.set_screen_size(container_id, screen_w, screen_h)
+                video_w, video_h = track.get_video_resolution()
+                logger.info("[WebRTC] ScrcpyTrack created, physical screen: %dx%d, video stream: %dx%d", 
+                           screen_w, screen_h, video_w, video_h)
             
-            # 使用 MediaRelay 复用视频流
-            # 这样多个客户端可以观看同一个容器的视频
+            # Use MediaRelay to multiplex video stream
             source_track = self._tracks[container_id]
             relayed_track = self._relay.subscribe(source_track)
             
-            print(f"[WebRTC] 源轨道类型: {type(source_track)}, 转发轨道类型: {type(relayed_track)}")
+            logger.debug("[WebRTC] Source track type: %s, relayed track type: %s", type(source_track).__name__, type(relayed_track).__name__)
             
-            # 先处理 SDP Offer，设置远端描述
-            # 关键：必须在添加轨道之前设置远端描述，以便 aiortc 正确进行编解码器协商
-            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=offer_type))
-            print(f"[WebRTC] SDP Offer 已设置")
+            # First set up DataChannel handler
+            self._setup_datachannel(pc, container_id)
             
-            # 设置 DataChannel 处理（必须在 setRemoteDescription 之后）
-            await self._setup_datachannel(pc, container_id)
+            # Also proactively create DataChannel on backend
+            logger.info("[WebRTC] Proactively creating 'control' DataChannel...")
+            backend_dc = pc.createDataChannel("control", ordered=True)
+            self._setup_backend_datachannel(backend_dc, pc, container_id)
             
-            # 设置连接关闭处理
+            # Set up connection close handling
             self._setup_connection_close(pc, container_id)
             
-            # 添加视频轨道到连接
-            # 重要：addTrack 必须在 setRemoteDescription 之后调用
-            # 这样 aiortc 才能正确将轨道与远端协商的编解码器关联
+            # Add video track first, then set remote description
             pc.addTrack(relayed_track)
-            print(f"[WebRTC] 已添加视频轨道到 RTCPeerConnection")
+            logger.info("[WebRTC] Added video track to RTCPeerConnection")
             
-            print(f"[WebRTC] SDP Offer 已设置，开始创建 Answer...")
+            # Check if SDP has video m-line
+            has_video_mline = "m=video" in sdp.lower()
+            logger.debug("[WebRTC] SDP contains video m-line: %s", has_video_mline)
+            
+            # Process SDP Offer, set remote description
+            logger.info("[WebRTC] Setting SDP Offer...")
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=offer_type))
+            logger.debug("[WebRTC] SDP Offer set")
+            
+            logger.info("[WebRTC] SDP Offer set, starting to create Answer...")
 
-            # 注意：必须先创建并发出 Answer，ICE 协商才能开始！
-            # 不能在 createAnswer 之前等待 ICE connected（否则是死锁）。
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            print(f"[WebRTC] SDP Answer 已创建并设置为本地描述")
+            # Try to create Answer
+            try:
+                answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+                logger.info("[WebRTC] SDP Answer created and set as local description")
+            except Exception as answer_error:
+                logger.warning("[WebRTC] createAnswer failed: %s", answer_error)
+                logger.info("[WebRTC] Trying to remove video track and retry...")
+                
+                for transceiver in pc.getTransceivers():
+                    if transceiver.sender and transceiver.sender.track:
+                        pc.removeTrack(transceiver.sender)
+                        logger.info("[WebRTC] Removed track: %s", transceiver.sender.track.kind)
+                
+                try:
+                    answer = await pc.createAnswer()
+                    await pc.setLocalDescription(answer)
+                    logger.info("[WebRTC] SDP Answer (no video) created")
+                except Exception as retry_error:
+                    logger.error("[WebRTC] Retry also failed: %s", retry_error)
+                    raise
             
-            # 必须等待 ICE Candidate 收集完成，否则本地 SDP 中没有物理 IP，前端无法直连
+            # Must wait for ICE candidate gathering to complete
             gathering_complete = asyncio.Event()
             
             @pc.on("icegatheringstatechange")
@@ -210,62 +504,77 @@ class WebRTCManager:
                 try:
                     await asyncio.wait_for(gathering_complete.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    print(f"[WebRTC] ICE 收集超时，尝试返回已有 SDP")
+                    logger.warning("[WebRTC] ICE gathering timeout, trying to return existing SDP")
             
-            # 返回包含完整 candidate 列表的 localDescription
+            # Validate Answer is valid
+            if not pc.localDescription or not pc.localDescription.sdp:
+                raise RuntimeError("Created SDP Answer is invalid")
+            
+            logger.debug("[WebRTC] Answer SDP length: %d", len(pc.localDescription.sdp))
+            
             return pc.localDescription
             
+        except HTTPException:
+            raise
+        except ValueError as e:
+            logger.error("[WebRTC] SDP parsing error: %s", e)
+            await self._cleanup_connection(pc, container_id)
+            raise HTTPException(
+                status_code=400,
+                detail=f"SDP format error: {str(e)}"
+            )
         except Exception as e:
-            import traceback
-            import sys
-            print(f"[WebRTC] 发生异常: {type(e).__name__}: {e}")
-            print(f"[WebRTC] 完整 traceback:")
+            logger.error("[WebRTC] Exception occurred: %s: %s", type(e).__name__, e)
+            logger.error("[WebRTC] Full traceback:")
             exc_type, exc_value, exc_tb = sys.exc_info()
             if exc_tb:
-                import traceback as tb_module
                 tb_list = tb_module.extract_tb(exc_tb)
                 for frame in tb_list:
-                    print(f"  File '{frame.filename}', line {frame.lineno}, in {frame.name}")
-                    print(f"    {frame.line}")
-            # 清理失败的连接
+                    logger.error("  File '%s', line %d, in %s", frame.filename, frame.lineno, frame.name)
+                    logger.error("    %s", frame.line)
             await self._cleanup_connection(pc, container_id)
             raise HTTPException(
                 status_code=500,
-                detail=f"WebRTC 连接建立失败: {type(e).__name__}: {str(e)}"
+                detail=f"WebRTC connection establishment failed: {type(e).__name__}: {str(e)}"
             )
     
-    async def _setup_datachannel(self, pc: RTCPeerConnection, container_id: str) -> None:
+    def _setup_datachannel(self, pc: RTCPeerConnection, container_id: str) -> None:
         """
-        设置 DataChannel 处理
+        Set up DataChannel handling
         
-        监听 "control" 数据通道，解析控制指令并转发到 AdbManager。
-        
-        关键：使用 asyncio.create_task() 调用异步 AdbManager 方法，
-        因为 DataChannel 的 on("message") 回调是同步函数。
+        Listen to "control" data channel, parse control commands and execute concurrently.
+        No longer uses serial queue, commands don't wait for previous one to complete.
         
         Args:
-            pc: RTCPeerConnection 实例
-            container_id: Docker 容器 ID
+            pc: RTCPeerConnection instance
+            container_id: Docker container ID
         """
         adb_manager = self._get_adb_manager()
         
         @pc.on("datachannel")
         def on_datachannel(channel):
-            """处理数据通道事件"""
+            """Handle data channel events"""
+            logger.debug("[WebRTC] DataChannel event: label=%s, state=%s", channel.label, channel.readyState)
+            
             if channel.label == "control":
-                # 监听控制消息
+                @channel.on("open")
+                def on_channel_open():
+                    logger.info("[WebRTC] Control DataChannel opened")
+                
+                @channel.on("close")
+                def on_channel_close():
+                    logger.debug("[WebRTC] Control DataChannel closed")
+                
+                @channel.on("error")
+                def on_channel_error(err):
+                    logger.error("[WebRTC] Control DataChannel error: %s", err)
+                
                 @channel.on("message")
                 def on_message(message):
                     """
-                    处理控制指令
+                    Handle control commands - execute concurrently, no queuing
                     
-                    消息格式：{"action": "click", "x": 100, "y": 200}
-                    支持的动作：
-                    - click/tap: 点击屏幕 {"action": "click", "x": int, "y": int}
-                    - swipe: 滑动屏幕 {"action": "swipe", "x1": int, "y1": int, "x2": int, "y2": int, "duration": int}
-                    - input: 文本输入 {"action": "input", "text": str}
-                    - keyevent: 按键事件 {"action": "keyevent", "keycode": int}
-                    - config: 获取分辨率配置 {"action": "config"}
+                    Message format: {"action": "click", "x": 100, "y": 200}
                     """
                     if message is None:
                         return
@@ -274,92 +583,128 @@ class WebRTCManager:
                         data = json.loads(message)
                         action = data.get("action")
                         
-                        # 关键：使用 asyncio.create_task() 调度异步任务
-                        # 不能直接 await，否则会阻塞事件循环
-                        if action == "click":
-                            asyncio.create_task(
-                                adb_manager.tap_with_conversion(
-                                    container_id,
-                                    data["x"],
-                                    data["y"],
-                                    data.get("video_width", 720),
-                                    data.get("video_height", 1280)
-                                )
-                            )
-                        elif action == "swipe":
-                            asyncio.create_task(
-                                adb_manager.swipe_with_conversion(
-                                    container_id,
-                                    data["x1"],
-                                    data["y1"],
-                                    data["x2"],
-                                    data["y2"],
-                                    data.get("duration", 300),
-                                    data.get("video_width", 720),
-                                    data.get("video_height", 1280)
-                                )
-                            )
-                        elif action == "input":
-                            asyncio.create_task(
-                                adb_manager.input_text(container_id, data["text"])
-                            )
-                        elif action == "keyevent":
-                            asyncio.create_task(
-                                adb_manager.keyevent(container_id, data["keycode"])
-                            )
-                        elif action == "config":
-                            # 前端请求分辨率配置
-                            # 从 track 获取实际分辨率
+                        # config is synchronous response
+                        if action == "config":
                             if container_id in self._tracks:
                                 track = self._tracks[container_id]
                                 width, height = track.get_video_resolution()
-                                # 回复配置信息
                                 if channel.readyState == "open":
                                     channel.send(json.dumps({
                                         "type": "config",
                                         "width": width,
                                         "height": height
                                     }))
-                    except json.JSONDecodeError:
-                        pass  # 忽略无效的 JSON
-                    except KeyError as e:
-                        # 缺少必要的参数
-                        pass
+                            return
+                        
+                        # Execute control commands concurrently, no queuing
+                        if action == "click":
+                            asyncio.create_task(self._exec_click(adb_manager, container_id, data))
+                        elif action == "swipe":
+                            asyncio.create_task(self._exec_swipe(adb_manager, container_id, data))
+                        elif action == "input":
+                            asyncio.create_task(self._exec_input(adb_manager, container_id, data))
+                        elif action == "keyevent":
+                            asyncio.create_task(self._exec_keyevent(adb_manager, container_id, data))
+                        elif action == "long_press":
+                            asyncio.create_task(self._exec_long_press(adb_manager, container_id, data))
+                        
+                    except json.JSONDecodeError as e:
+                        logger.error("[WebRTC] JSON parsing failed: %s", e)
+                    except Exception as e:
+                        logger.error("[WebRTC] Exception during message processing: %s", e)
+
+    def _setup_backend_datachannel(self, channel, pc: RTCPeerConnection, container_id: str) -> None:
+        """
+        Set up handler for backend-initiated DataChannel
+        
+        Args:
+            channel: RTCDataChannel instance
+            pc: RTCPeerConnection instance
+            container_id: Docker container ID
+        """
+        adb_manager = self._get_adb_manager()
+        
+        @channel.on("open")
+        def on_channel_open():
+            logger.info("[WebRTC] Backend DataChannel opened")
+        
+        @channel.on("close")
+        def on_channel_close():
+            logger.debug("[WebRTC] Backend DataChannel closed")
+        
+        @channel.on("error")
+        def on_channel_error(err):
+            logger.error("[WebRTC] Backend DataChannel error: %s", err)
+        
+        @channel.on("message")
+        def on_message(message):
+            """Handle backend DataChannel messages - execute concurrently"""
+            if message is None:
+                return
+            
+            try:
+                data = json.loads(message)
+                action = data.get("action")
+                
+                # config is synchronous response
+                if action == "config":
+                    if container_id in self._tracks:
+                        track = self._tracks[container_id]
+                        width, height = track.get_video_resolution()
+                        if channel.readyState == "open":
+                            channel.send(json.dumps({
+                                "type": "config",
+                                "width": width,
+                                "height": height
+                            }))
+                    return
+                
+                # Execute concurrently
+                if action == "click":
+                    asyncio.create_task(self._exec_click(adb_manager, container_id, data))
+                elif action == "swipe":
+                    asyncio.create_task(self._exec_swipe(adb_manager, container_id, data))
+                elif action == "input":
+                    asyncio.create_task(self._exec_input(adb_manager, container_id, data))
+                elif action == "keyevent":
+                    asyncio.create_task(self._exec_keyevent(adb_manager, container_id, data))
+                elif action == "long_press":
+                    asyncio.create_task(self._exec_long_press(adb_manager, container_id, data))
+                    
+            except json.JSONDecodeError as e:
+                logger.error("[WebRTC] JSON parsing failed: %s", e)
+            except Exception as e:
+                logger.error("[WebRTC] Exception during message processing: %s", e)
 
     def _setup_connection_close(self, pc: RTCPeerConnection, container_id: str) -> None:
         """
-        设置连接关闭处理
-        
-        当连接关闭时，自动清理连接记录。
+        Set up connection close handling
         
         Args:
-            pc: RTCPeerConnection 实例
-            container_id: Docker 容器 ID
+            pc: RTCPeerConnection instance
+            container_id: Docker container ID
         """
         @pc.on("iceconnectionstatechange")
         async def on_ice_connection_state_change():
-            """监听 ICE 连接状态变化"""
             if pc.iceConnectionState == "closed" or pc.iceConnectionState == "failed":
                 await self._cleanup_connection(pc, container_id)
     
     async def _cleanup_connection(self, pc: Optional[RTCPeerConnection], container_id: str) -> None:
         """
-        清理连接资源
+        Cleanup connection resources
         
         Args:
-            pc: RTCPeerConnection 实例
-            container_id: Docker 容器 ID
+            pc: RTCPeerConnection instance
+            container_id: Docker container ID
         """
         if pc is None:
             return
         
-        # 从连接记录中移除
         if container_id in self._connections:
             self._connections[container_id].discard(pc)
             if not self._connections[container_id]:
                 del self._connections[container_id]
         
-        # 如果这个容器没有更多连接，停止视频轨道
         if container_id not in self._connections:
             if container_id in self._tracks:
                 try:
@@ -368,23 +713,90 @@ class WebRTCManager:
                     pass
                 del self._tracks[container_id]
         
-        # 关闭 RTCPeerConnection
         try:
             await pc.close()
         except Exception:
             pass
-    
+
+    async def change_quality(self, container_id: str, quality_name: str) -> dict:
+        """
+        Change video quality for an existing container's stream.
+
+        This will restart the ScrcpyTrack with the new quality settings,
+        effectively reinitializing the video stream.
+
+        Args:
+            container_id: Docker container ID
+            quality_name: Quality level name ("high", "medium", "low")
+
+        Returns:
+            dict: Contains success status and new quality info
+
+        Raises:
+            HTTPException: If container or quality not found
+        """
+        quality = VideoQualityLevel.from_name(quality_name)
+
+        if container_id not in self._tracks:
+            raise HTTPException(status_code=404, detail=f"No track found for container {container_id}")
+
+        track = self._tracks[container_id]
+        old_quality = track.get_quality()
+
+        logger.info("[WebRTC] Changing quality for container %s: %s -> %s",
+                     container_id, old_quality.name, quality.name)
+
+        await track.restart_with_quality(quality)
+
+        return {
+            "success": True,
+            "container_id": container_id,
+            "old_quality": old_quality.name,
+            "new_quality": quality.name,
+            "max_size": quality.max_size,
+            "bitrate": quality.bitrate
+        }
+
+    async def get_connection_stats(self, container_id: str) -> dict:
+        """
+        Get WebRTC connection statistics for monitoring.
+
+        Args:
+            container_id: Docker container ID
+
+        Returns:
+            dict: Connection statistics including bandwidth estimates
+        """
+        if container_id not in self._connections or not self._connections[container_id]:
+            return {"status": "no_connection"}
+
+        pc = next(iter(self._connections[container_id]))
+
+        try:
+            stats = await pc.getStats()
+            for report in stats.values():
+                if report.type == "candidate-pair" and report.get("state") == "succeeded":
+                    return {
+                        "status": "connected",
+                        "available_outgoing_bitrate": report.get("availableOutgoingBitrate", 0),
+                        "packets_lost": report.get("packetsLost", 0),
+                        "round_trip_time": report.get("currentRoundTripTime", 0),
+                        "bytes_sent": report.get("bytesSent", 0),
+                        "remote_timestamp": report.get("remoteTimestamp", 0)
+                    }
+            return {"status": "no_active_candidate_pair"}
+        except Exception as e:
+            logger.warning("[WebRTC] Failed to get connection stats: %s", e)
+            return {"status": "error", "error": str(e)}
+
     async def close_all(self) -> None:
         """
-        关闭所有 WebRTC 连接
-        
-        在应用关闭时调用，确保所有资源被正确释放。
+        Close all WebRTC connections
         """
         for container_id in list(self._connections.keys()):
             for pc in list(self._connections[container_id]):
                 await self._cleanup_connection(pc, container_id)
         
-        # 停止所有视频轨道
         for container_id in list(self._tracks.keys()):
             if container_id not in self._connections or not self._connections[container_id]:
                 try:
@@ -395,7 +807,7 @@ class WebRTCManager:
 
 
 # ============================================================================
-# 全局实例获取函数
+# Global Instance Accessor Function
 # ============================================================================
 
 _webrtc_manager: Optional[WebRTCManager] = None
@@ -403,10 +815,10 @@ _webrtc_manager: Optional[WebRTCManager] = None
 
 def get_webrtc_manager() -> WebRTCManager:
     """
-    获取 WebRTCManager 全局单例实例
+    Get WebRTCManager global singleton instance
     
     Returns:
-        WebRTCManager: WebRTC 管理器实例
+        WebRTCManager: WebRTC manager instance
     """
     global _webrtc_manager
     if _webrtc_manager is None:
@@ -416,9 +828,7 @@ def get_webrtc_manager() -> WebRTCManager:
 
 async def shutdown_webrtc_manager() -> None:
     """
-    关闭 WebRTC 管理器
-    
-    在应用关闭时调用。
+    Shutdown WebRTC manager
     """
     global _webrtc_manager
     if _webrtc_manager is not None:

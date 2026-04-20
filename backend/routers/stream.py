@@ -1,83 +1,157 @@
-"""
-Outland Backend - Stream Router
-
-提供 WebRTC 流媒体相关的 API 路由。
-
-接口：
-- POST /api/stream/webrtc/offer: 处理 WebRTC Offer 并返回 Answer
-"""
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-
-import os
 import httpx
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
 
-# ============================================================================
-# Pydantic Models
-# ============================================================================
-
-class WebRTCOfferRequest(BaseModel):
-    """
-    WebRTC Offer 请求模型
-    """
-    container_id: str
-    sdp: str
-    type: str = "offer"
-
-class WebRTCAnswerResponse(BaseModel):
-    """
-    WebRTC Answer 响应模型
-    """
-    sdp: str
-    type: str
-
-# ============================================================================
-# Router
-# ============================================================================
-
-router = APIRouter()
-
-
-@router.post(
-    "/webrtc/offer",
-    response_model=WebRTCAnswerResponse,
-    responses={
-        404: {"description": "容器不存在"},
-        500: {"description": "WebRTC 连接建立失败"},
-        502: {"description": "无法连接远程 Agent"}
-    },
-    summary="代理 WebRTC Offer",
-    description="将前端发来的 WebRTC SDP Offer 透明转发给对应容器所属的 Agent。"
+from auth.dependencies import get_current_user
+from database import get_db
+from database.models import User, Container
+from models import (
+    WebRTCOfferRequest, WebRTCAnswerResponse,
+    QualityChangeRequest, QualityChangeResponse,
+    ConnectionStatsResponse
 )
-async def handle_webrtc_offer(request: WebRTCOfferRequest) -> WebRTCAnswerResponse:
-    agent_url = os.environ.get("AGENT_URL")
-    if not agent_url:
-        raise HTTPException(status_code=500, detail="未配置 AGENT_URL 环境变量，网关无法转发请求")
-        
+from services import get_agent_url
+from core.http_client import get_http_client
+
+router = APIRouter(prefix="/api/stream", tags=["Stream"])
+
+
+async def verify_container_ownership(db: AsyncSession, container_id: str, user: User) -> Container:
+    result = await db.execute(
+        select(Container).where(
+            Container.container_id == container_id,
+            Container.user_id == user.id,
+            Container.status.in_(["running", "pending"])
+        )
+    )
+    container = result.scalar_one_or_none()
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found or not owned by you")
+    return container
+
+
+@router.post("/webrtc/offer", response_model=WebRTCAnswerResponse)
+async def handle_webrtc_offer(
+    request: WebRTCOfferRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    db_container = await verify_container_ownership(db, request.container_id, current_user)
+    agent_id = request.agent_id or db_container.agent_id
+
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{agent_url}/api/stream/webrtc/offer",
-                json=request.model_dump()
-            )
-            
-            # 如果 Agent 返回 404/500 等错误，抛出同样的错误
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-                
-            data = resp.json()
-            return WebRTCAnswerResponse(**data)
-            
+        agent_url, agent_id = get_agent_url(agent_id)
+
+        resp = await get_http_client().post(
+            f"{agent_url}/api/stream/webrtc/offer",
+            json={
+                "container_id": request.container_id,
+                "sdp": request.sdp,
+                "type": request.type
+            },
+            timeout=60.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        return WebRTCAnswerResponse(
+            sdp=data.get("sdp", ""),
+            type=data.get("type", "answer")
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"WebRTC processing failed: {e.response.text}"
+        )
     except httpx.RequestError as e:
         raise HTTPException(
-            status_code=502,
-            detail=f"无法连接到远端 Agent ({agent_url}): {str(e)}"
+            status_code=503,
+            detail=f"Cannot connect to Agent: {str(e)}"
         )
-    except HTTPException:
-        raise
-    except Exception as e:
+
+
+@router.post("/quality", response_model=QualityChangeResponse)
+async def change_quality(
+    request: QualityChangeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    db_container = await verify_container_ownership(db, request.container_id, current_user)
+
+    try:
+        agent_url, agent_id = get_agent_url(db_container.agent_id)
+
+        resp = await get_http_client().post(
+            f"{agent_url}/api/stream/quality",
+            json={
+                "container_id": request.container_id,
+                "quality": request.quality
+            },
+            timeout=30.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        return QualityChangeResponse(
+            success=data.get("success", True),
+            container_id=data.get("container_id", ""),
+            old_quality=data.get("old_quality", ""),
+            new_quality=data.get("new_quality", ""),
+            max_size=data.get("max_size", 0),
+            bitrate=data.get("bitrate", 0)
+        )
+
+    except httpx.HTTPStatusError as e:
         raise HTTPException(
-            status_code=500,
-            detail=f"代理 WebRTC 请求时发生未知错误: {str(e)}"
+            status_code=e.response.status_code,
+            detail=f"Quality change failed: {e.response.text}"
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to Agent: {str(e)}"
+        )
+
+
+@router.get("/stats/{container_id}", response_model=ConnectionStatsResponse)
+async def get_connection_stats(
+    container_id: str,
+    agent_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    db_container = await verify_container_ownership(db, container_id, current_user)
+    agent_id = agent_id or db_container.agent_id
+
+    try:
+        agent_url, agent_id = get_agent_url(agent_id)
+
+        resp = await get_http_client().get(
+            f"{agent_url}/api/stream/stats/{container_id}",
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        return ConnectionStatsResponse(
+            status=data.get("status", "unknown"),
+            available_outgoing_bitrate=data.get("available_outgoing_bitrate"),
+            packets_lost=data.get("packets_lost"),
+            round_trip_time=data.get("round_trip_time"),
+            bytes_sent=data.get("bytes_sent"),
+            error=data.get("error")
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Failed to get stats: {e.response.text}"
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to Agent: {str(e)}"
         )

@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import { AuthGuard } from './auth-guard'
 
 export const metadata: Metadata = {
   title: 'Outland - 安卓云容器平台',
@@ -14,7 +15,7 @@ export default function RootLayout({
   return (
     <html lang="zh-CN">
       <body className="bg-background text-gray-100 min-h-screen antialiased">
-        {children}
+        <AuthGuard>{children}</AuthGuard>
       </body>
     </html>
   )

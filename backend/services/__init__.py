@@ -1,5 +1,15 @@
-"""
-Outland Backend - Services Package
+from .agent_registry import (
+    AGENT_REGISTRY,
+    get_agent_url,
+    cleanup_stale_agents,
+    fetch_agent_instances,
+    agent_cleanup_loop,
+)
 
-提供 Redroid 容器控制的核心服务模块。
-"""
+__all__ = [
+    "AGENT_REGISTRY",
+    "get_agent_url",
+    "cleanup_stale_agents",
+    "fetch_agent_instances",
+    "agent_cleanup_loop",
+]

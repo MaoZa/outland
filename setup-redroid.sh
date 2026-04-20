@@ -1,90 +1,90 @@
 #!/bin/bash
 # ============================================
-# Outland - Ubuntu 服务器 Redroid 一键部署脚本
+# Outland - Ubuntu Server Redroid One-Click Deployment Script
 # ============================================
-# 使用方法: chmod +x setup-redroid.sh && sudo ./setup-redroid.sh
+# Usage: chmod +x setup-redroid.sh && sudo ./setup-redroid.sh
 
 set -e
 
 echo "=========================================="
-echo "  Outland Redroid 部署脚本"
+echo "  Outland Redroid Deployment Script"
 echo "=========================================="
 
-# 1. 检查是否为 root
+# 1. Check if running as root
 if [ "$EUID" -ne 0 ]; then
-  echo "❌ 请使用 sudo 运行此脚本"
+  echo "Please run this script with sudo"
   exit 1
 fi
 
-# 2. 安装 Docker（如果尚未安装）
+# 2. Install Docker (if not already installed)
 if ! command -v docker &> /dev/null; then
-  echo "📦 正在安装 Docker..."
+  echo "Installing Docker..."
   curl -fsSL https://get.docker.com | sh
   systemctl enable docker
   systemctl start docker
-  echo "✅ Docker 安装完成"
+  echo "Docker installation complete"
 else
-  echo "✅ Docker 已安装: $(docker --version)"
+  echo "Docker is already installed: $(docker --version)"
 fi
 
-# 3. 加载 binder 内核模块（Redroid 必需）
-echo "🔧 正在加载 binder 内核模块..."
+# 3. Load binder kernel module (required for Redroid)
+echo "Loading binder kernel module..."
 if ! lsmod | grep -q binder_linux; then
-  # 尝试直接加载
+  # Try to load directly
   modprobe binder_linux devices="binder,hwbinder,vndbinder" 2>/dev/null || {
-    echo "⚠️  binder_linux 模块未找到，尝试安装 linux-modules-extra..."
+    echo "binder_linux module not found, trying to install linux-modules-extra..."
     apt-get update
     apt-get install -y "linux-modules-extra-$(uname -r)" || {
-      echo "❌ 无法安装 binder 内核模块。"
-      echo "   请手动安装: apt install linux-modules-extra-\$(uname -r)"
-      echo "   然后重新运行此脚本"
+      echo "Failed to install binder kernel module."
+      echo "Please install manually: apt install linux-modules-extra-$(uname -r)"
+      echo "Then run this script again"
       exit 1
     }
     modprobe binder_linux devices="binder,hwbinder,vndbinder"
   }
 fi
 
-# 确保开机自动加载
+# Ensure auto-load on boot
 echo "binder_linux" > /etc/modules-load.d/binder.conf
 echo "options binder_linux devices=binder,hwbinder,vndbinder" > /etc/modprobe.d/binder.conf
-echo "✅ binder 模块已加载并设为开机启动"
+echo "Binder module loaded and set to auto-start"
 
-# 4. 验证 binder 设备
+# 4. Verify binder device
 if ls /dev/binder* &>/dev/null; then
-  echo "✅ binder 设备就绪: $(ls /dev/binder*)"
+  echo "Binder device ready: $(ls /dev/binder*)"
 else
-  echo "⚠️  /dev/binder* 设备未出现，Redroid 可能无法正常启动"
+  echo "Warning: /dev/binder* devices not found, Redroid may not start properly"
 fi
 
-# 5. 开放防火墙端口
-echo "🔥 配置防火墙..."
+# 5. Configure firewall
+echo "Configuring firewall..."
 if command -v ufw &> /dev/null; then
   ufw allow 5037/tcp comment "ADB Server (Outland)"
   ufw allow 5555/tcp comment "ADB Direct (Outland)"
-  echo "✅ 防火墙已放行 5037 和 5555 端口"
+  echo "Firewall configured to allow ports 5037 and 5555"
 else
-  echo "⚠️  未检测到 ufw，请手动确保 5037 和 5555 端口可访问"
+  echo "Warning: ufw not detected, please ensure ports 5037 and 5555 are accessible"
 fi
 
-# 6. 启动 Redroid
-echo "🚀 正在启动 Redroid 容器..."
+# 6. Start Redroid
+echo "Starting Redroid container..."
 docker compose -f docker-compose.redroid.yml up -d
 
 echo ""
 echo "=========================================="
-echo "  ✅ 部署完成！"
+echo "  Deployment Complete!"
 echo "=========================================="
 echo ""
-echo "  Redroid 容器状态:"
-docker ps --filter "name=outland-redroid" --format "  📱 {{.Names}}: {{.Status}}"
-docker ps --filter "name=outland-adb-proxy" --format "  🔌 {{.Names}}: {{.Status}}"
+echo "  Redroid container status:"
+docker ps --filter "name=outland-redroid" --format "  Device: {{.Names}}: {{.Status}}"
+docker ps --filter "name=outland-adb-proxy" --format "  Proxy: {{.Names}}: {{.Status}}"
 echo ""
-echo "  本机 IP 的 5037 端口 = ADB Server"
-echo "  本机 IP 的 5555 端口 = ADB Direct"
+echo "  Port 5037 on this machine = ADB Server"
+echo "  Port 5555 on this machine = ADB Direct"
 echo ""
-echo "  在你的 Windows 端 docker-compose.yml 中设置:"
-echo "    REDROID_HOST=<本机IP>"
-echo "    ADB_SERVER_SOCKET=tcp:<本机IP>:5037"
+echo "  In your Windows docker-compose.yml, set:"
+echo "    REDROID_HOST=<this machine's IP>"
+echo "    ADB_SERVER_SOCKET=tcp:<this machine's IP>:5037"
 echo ""
-echo "  验证连接: adb connect <本机IP>:5555"
+echo "  Verify connection: adb connect <this machine's IP>:5555"
 echo "=========================================="

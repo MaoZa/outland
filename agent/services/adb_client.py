@@ -1,88 +1,107 @@
 """
 Outland Agent - ADB Client Manager
 
-提供与 Redroid 容器的异步 ADB 连接管理。
-采用 adb-shell[async] 库直接通过 TCP 协议控制安卓设备。
+xProvides asynchronous ADB connection management with Redroid containers.
+Uses adb-shell[async] library to control Android devices via TCP protocol.
 
-核心特性（简化版 - 本地部署）：
-- 单例模式：全局唯一的 AdbManager 实例
-- 连接缓存：复用 ADB TCP 连接，避免重复握手
-- 简化的端口发现：直接使用 5555 端口
+Core Features (Simplified - Local Deployment):
+- Singleton pattern: Global unique AdbManager instance
+- Connection cache: Reuse ADB TCP connections to avoid repeated handshakes
+- Simplified port discovery: Direct use of port 5555
 """
 
 import asyncio
 import collections
+import json
 import logging
 import os
+import re
 import socket
-from typing import Dict, Optional
+import uuid
+from typing import Dict, List, Optional
 
 import docker
+import httpx
 from adb_shell.adb_device_async import AdbDeviceTcpAsync
-
 from fastapi import HTTPException
 
-# 配置日志
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# 常量定义
+# Constants
 # ============================================================================
 
-# ADB Server 配置（从环境变量读取）
+# ADB Server configuration (from environment variables)
 ADB_SERVER_HOST: str = os.environ.get("ADB_SERVER_HOST", "127.0.0.1")
 ADB_SERVER_PORT: int = int(os.environ.get("ADB_SERVER_PORT", "5037"))
 
-# Redroid 主机地址
-REDRoid_HOST: str = os.environ.get("REDROID_HOST", "127.0.0.1")
+# Redroid host address
+# Priority: environment variable > localhost
+# 
+# Note: Agent is deployed on host machine (host network mode), redroid uses bridge network + port mapping
+# Therefore Agent must access redroid via localhost:port
+def _get_redroid_host() -> str:
+    """Get Redroid host address"""
+    # 1. Environment variable (highest priority, allows manual override)
+    env_host = os.environ.get("REDROID_HOST")
+    if env_host:
+        return env_host
+    # 2. Host deployment mode: Agent runs directly on the physical machine
+    #    Redroid container uses bridge network + port mapping, Agent accesses via localhost
+    if not os.path.exists("/.dockerenv"):
+        return "localhost"
+    # 3. Container deployment mode: Agent runs in Docker container
+    return "host.docker.internal"
 
-# Redroid 容器的 ADB 服务端口
-REDRoid_ADB_PORT: int = int(os.environ.get("REDROID_ADB_PORT", "5555"))
+REDROID_HOST: str = _get_redroid_host()
 
-# ADB 连接超时时间（秒）
+# Redroid container's ADB service port
+REDROID_ADB_PORT: int = int(os.environ.get("REDROID_ADB_PORT", "5555"))
+
+# ADB connection timeout (seconds)
 ADB_CONNECT_TIMEOUT: float = 10.0
 
-# ADB Shell 执行超时时间（秒）
+# ADB shell execution timeout (seconds)
 ADB_SHELL_TIMEOUT: float = 5.0
 
 
 # ============================================================================
-# ADB 设备异常类
+# ADB Device Exception Classes
 # ============================================================================
 
 class AdbOperationError(Exception):
-    """ADB 操作失败异常"""
+    """ADB operation failure exception"""
     pass
 
 
 class AdbConnectionError(Exception):
-    """ADB 连接失败异常"""
+    """ADB connection failure exception"""
     pass
 
 
 # ============================================================================
-# AdbManager 单例类
+# AdbManager Singleton Class
 # ============================================================================
 
 class AdbManager:
     """
-    ADB 设备管理器（单例模式）
+    ADB device manager (singleton pattern)
     
-    负责管理与所有安卓容器的异步 ADB 连接。
-    简化版：直接连接 localhost:5555
+    Manages asynchronous ADB connections with all Android containers.
+    Simplified: Direct connection to localhost:5555
     
     Attributes:
-        _instance: 单例实例
-        _devices: 设备连接缓存字典，以 container_id 为键
-        _locks: 每个容器的异步锁字典，防止并发握手踩踏
-        _screen_sizes: 缓存每个容器的实际屏幕分辨率
+        _instance: Singleton instance
+        _devices: Device connection cache dict, keyed by container_id
+        _locks: Async lock dict for each container, prevents concurrent handshake collisions
+        _screen_sizes: Cache of actual screen resolution for each container
     """
     
     _instance: Optional["AdbManager"] = None
     
     def __new__(cls) -> "AdbManager":
-        """确保全局只有一个 AdbManager 实例"""
+        """Ensure only one AdbManager instance globally"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
@@ -90,7 +109,7 @@ class AdbManager:
     
     def __init__(self) -> None:
         """
-        初始化 AdbManager
+        Initialize AdbManager
         """
         if self._initialized:
             return
@@ -98,24 +117,24 @@ class AdbManager:
         self._devices: Dict[str, AdbDeviceTcpAsync] = {}
         self._locks: Dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
         self._initialized = True
-        # 缓存每个容器的实际屏幕分辨率
+        # Cache actual screen resolution for each container
         self._screen_sizes: Dict[str, tuple[int, int]] = {}
     
     # =========================================================================
-    # 公开 API：底层动作封装
+    # Public API: Low-level action wrappers
     # =========================================================================
     
     async def tap(self, container_id: str, x: int, y: int) -> None:
         """
-        执行屏幕点击操作
+        Execute screen tap action
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            x: 点击的 X 坐标
-            y: 点击的 Y 坐标
+            container_id: Docker container ID or name
+            x: X coordinate of tap
+            y: Y coordinate of tap
             
         Raises:
-            HTTPException: 容器不存在或 ADB 连接失败
+            HTTPException: Container not found or ADB connection failed
         """
         await self._execute(container_id, f"input tap {x} {y}")
     
@@ -129,18 +148,18 @@ class AdbManager:
         duration: int = 300
     ) -> None:
         """
-        执行屏幕滑动操作
+        Execute screen swipe action
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            x1: 起始 X 坐标
-            y1: 起始 Y 坐标
-            x2: 结束 X 坐标
-            y2: 结束 Y 坐标
-            duration: 滑动持续时间（毫秒），默认 300ms
+            container_id: Docker container ID or name
+            x1: Start X coordinate
+            y1: Start Y coordinate
+            x2: End X coordinate
+            y2: End Y coordinate
+            duration: Swipe duration (milliseconds), default 300ms
             
         Raises:
-            HTTPException: 容器不存在或 ADB 连接失败
+            HTTPException: Container not found or ADB connection failed
         """
         await self._execute(
             container_id,
@@ -149,73 +168,87 @@ class AdbManager:
     
     async def input_text(self, container_id: str, text: str) -> None:
         """
-        执行文本输入操作
+        Execute text input action
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            text: 要输入的文本内容
+            container_id: Docker container ID or name
+            text: Text content to input
             
         Raises:
-            HTTPException: 容器不存在或 ADB 连接失败
+            HTTPException: Container not found or ADB connection failed
             
         Note:
-            文本会经过严格的 Shell 转义，防止注入攻击。
-            单引号会被转义为 '\''（单引号-反斜杠-单引号-单引号）
+            Text is strictly shell-escaped to prevent injection attacks.
+            Single quotes are escaped as '\'' (single quote - backslash - single quote - single quote)
         """
         escaped = self._escape_shell_text(text)
         await self._execute(container_id, f"input text {escaped}")
     
     async def keyevent(self, container_id: str, keycode: int) -> None:
         """
-        执行按键事件
+        Execute key event
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            keycode: Android 按键码（如 26=POWER, 4=BACK, 3=HOME）
+            container_id: Docker container ID or name
+            keycode: Android keycode (e.g., 26=POWER, 4=BACK, 3=HOME)
             
         Raises:
-            HTTPException: 容器不存在或 ADB 连接失败
+            HTTPException: Container not found or ADB connection failed
         """
         await self._execute(container_id, f"input keyevent {keycode}")
     
     # =========================================================================
-    # 屏幕分辨率和坐标转换
+    # Screen resolution and coordinate conversion
     # =========================================================================
+    
+    def set_screen_size(self, container_id: str, width: int, height: int) -> None:
+        """
+        Set container screen resolution cache
+        
+        Performance optimization: Allows external (e.g., WebRTCManager) to pre-cache resolution,
+        avoiding wm size command calls (~100-200ms overhead).
+        
+        Args:
+            container_id: Docker container ID or name
+            width: Screen width
+            height: Screen height
+        """
+        self._screen_sizes[container_id] = (width, height)
+        logger.debug("[AdbManager] Pre-cached screen resolution %s: %dx%d", container_id, width, height)
     
     async def get_screen_size(self, container_id: str) -> tuple[int, int]:
         """
-        获取容器的实际屏幕分辨率
+        Get actual screen resolution of container
         
-        使用 `wm size` 命令获取物理屏幕分辨率。
-        结果会被缓存以提高性能。
+        Uses `wm size` command to get physical screen resolution.
+        Results are cached for performance.
         
         Args:
-            container_id: Docker 容器 ID 或名称
+            container_id: Docker container ID or name
             
         Returns:
-            tuple[int, int]: (宽度, 高度)
+            tuple[int, int]: (width, height)
         """
-        # 检查缓存
+        # Check cache
         if container_id in self._screen_sizes:
             return self._screen_sizes[container_id]
         
-        # 执行 wm size 命令
+        # Execute wm size command
         result = await self._execute(container_id, "wm size")
         
-        # 解析输出，如 "Physical size: 720x1280"
-        import re
+        # Parse output, e.g., "Physical size: 720x1280"
         match = re.search(r"Physical size:\s*(\d+)x(\d+)", result)
         if match:
             width = int(match.group(1))
             height = int(match.group(2))
         else:
-            # 默认值
+            # Default values
             width = 720
             height = 1280
         
-        # 缓存结果
+        # Cache result
         self._screen_sizes[container_id] = (width, height)
-        logger.info(f"[AdbManager] 屏幕分辨率 {container_id}: {width}x{height}")
+        logger.info("[AdbManager] Screen resolution %s: %dx%d", container_id, width, height)
         return (width, height)
     
     async def _convert_coordinates(
@@ -227,37 +260,92 @@ class AdbManager:
         scrcpy_height: int
     ) -> tuple[int, int]:
         """
-        将 Scrcpy 视频流坐标转换为实际屏幕坐标
-        
-        由于 Scrcpy 视频流可能经过缩放，需要将触摸坐标从视频分辨率
-        转换为实际屏幕分辨率。
-        
+        Convert Scrcpy video stream coordinates to actual screen coordinates
+
+        Key handling (4 cases):
+        - Portrait video + Portrait screen: no conversion needed (usually equal resolution)
+        - Landscape video + Landscape screen: no conversion needed (usually equal resolution)
+        - Landscape video + Portrait screen: swap axes (video rotated 90° for portrait screen)
+        - Portrait video + Landscape screen: swap axes + coordinate flip (video rotated -90° for landscape screen)
+
         Args:
-            container_id: Docker 容器 ID 或名称
-            x: Scrcpy 视频中的 X 坐标
-            y: Scrcpy 视频中的 Y 坐标
-            scrcpy_width: Scrcpy 视频宽度
-            scrcpy_height: Scrcpy 视频高度
-            
+            container_id: Docker container ID or name
+            x: X coordinate in Scrcpy video
+            y: Y coordinate in Scrcpy video
+            scrcpy_width: Scrcpy video width
+            scrcpy_height: Scrcpy video height
+
         Returns:
-            tuple[int, int]: (实际屏幕 X, 实际屏幕 Y)
+            tuple[int, int]: (actual screen X, actual screen Y)
         """
         screen_width, screen_height = await self.get_screen_size(container_id)
-        
-        # 计算缩放比例
+
+        is_landscape_video = scrcpy_width > scrcpy_height
+        is_landscape_screen = screen_width > screen_height
+
+        logger.info(
+            "[AdbManager] Coordinate conversion START %s: tap(%d,%d) video=%dx%d(%s) screen=%dx%d(%s)",
+            container_id, x, y,
+            scrcpy_width, scrcpy_height, "landscape" if is_landscape_video else "portrait",
+            screen_width, screen_height, "landscape" if is_landscape_screen else "portrait"
+        )
+
+        # Case 1: Equal resolution - no conversion needed
+        if screen_width == scrcpy_width and screen_height == scrcpy_height:
+            logger.info(
+                "[AdbManager] Case1-SAME: (%d,%d) -> (%d,%d) [no conversion needed]",
+                x, y, x, y
+            )
+            return (x, y)
+
+        # Case 2: Portrait video on Landscape screen (container rotated -90° to display portrait content)
+        # Example: video=720x1280, screen=1280x720
+        # Video top (videoY=0) appears at screen right edge after -90° rotation
+        if not is_landscape_video and is_landscape_screen:
+            # For -90° rotation:
+            # - video's Y maps to screen's X (proportional)
+            # - video's X maps to screen's Y (proportional)
+            real_x = int(y * screen_width / scrcpy_height)
+            real_y = int(x * screen_height / scrcpy_width)
+            # Clamp to screen bounds
+            real_x = max(0, min(real_x, screen_width - 1))
+            real_y = max(0, min(real_y, screen_height - 1))
+
+            logger.info(
+                "[AdbManager] Case2-PORTRAIT_ON_LANDSCAPE: (%d,%d) @ %dx%d -> (%d,%d) @ %dx%d [rotation -90°]",
+                x, y, scrcpy_width, scrcpy_height, real_x, real_y, screen_width, screen_height
+            )
+            return (real_x, real_y)
+
+        # Case 3: Landscape video on Portrait screen (video rotated 90° to fit portrait screen)
+        # Example: video=1280x720, screen=720x1280
+        if is_landscape_video and not is_landscape_screen:
+            real_x = int(y * screen_width / scrcpy_height)
+            real_y = int(x * screen_height / scrcpy_width)
+            real_x = max(0, min(real_x, screen_width - 1))
+            real_y = max(0, min(real_y, screen_height - 1))
+
+            logger.info(
+                "[AdbManager] Case3-LANDSCAPE_ON_PORTRAIT: (%d,%d) @ %dx%d -> (%d,%d) @ %dx%d [rotation 90°]",
+                x, y, scrcpy_width, scrcpy_height, real_x, real_y, screen_width, screen_height
+            )
+            return (real_x, real_y)
+
+        # Case 4: Fallback - scale only (no rotation)
+        # This handles cases where video and screen have same orientation but different sizes
         scale_x = screen_width / scrcpy_width
         scale_y = screen_height / scrcpy_height
-        
-        # 转换坐标
+
         real_x = int(x * scale_x)
         real_y = int(y * scale_y)
-        
-        logger.debug(
-            f"[AdbManager] 坐标转换 {container_id}: "
-            f"({x}, {y}) @ {scrcpy_width}x{scrcpy_height} → "
-            f"({real_x}, {real_y}) @ {screen_width}x{screen_height}"
+        real_x = max(0, min(real_x, screen_width - 1))
+        real_y = max(0, min(real_y, screen_height - 1))
+
+        logger.info(
+            "[AdbManager] Case4-SCALE_ONLY: (%d,%d) @ %dx%d -> (%d,%d) @ %dx%d [scale %.3f,%.3f]",
+            x, y, scrcpy_width, scrcpy_height, real_x, real_y, screen_width, screen_height, scale_x, scale_y
         )
-        
+
         return (real_x, real_y)
     
     async def tap_with_conversion(
@@ -269,22 +357,28 @@ class AdbManager:
         scrcpy_height: int
     ) -> None:
         """
-        执行屏幕点击操作（带坐标转换）
+        Execute screen tap action (with coordinate conversion)
         
-        将 Scrcpy 视频流坐标转换为实际屏幕坐标后执行点击。
+        Converts Scrcpy video stream coordinates to actual screen coordinates before tapping.
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            x: Scrcpy 视频中的 X 坐标
-            y: Scrcpy 视频中的 Y 坐标
-            scrcpy_width: Scrcpy 视频宽度
-            scrcpy_height: Scrcpy 视频高度
-            
+            container_id: Docker container ID or name
+            x: X coordinate in Scrcpy video
+            y: Y coordinate in Scrcpy video
+            scrcpy_width: Scrcpy video width
+            scrcpy_height: Scrcpy video height
+
         Raises:
-            HTTPException: 容器不存在或 ADB 连接失败
+            HTTPException: Container not found or ADB connection failed
         """
         real_x, real_y = await self._convert_coordinates(
             container_id, x, y, scrcpy_width, scrcpy_height
+        )
+        # Get screen size for logging
+        sw, sh = await self.get_screen_size(container_id)
+        logger.info(
+            "[AdbManager] TAP: video(%d,%d) @ %dx%d -> screen(%d,%d) @ %dx%d | cmd: input tap %d %d",
+            x, y, scrcpy_width, scrcpy_height, real_x, real_y, sw, sh, real_x, real_y
         )
         await self._execute(container_id, f"input tap {real_x} {real_y}")
     
@@ -300,22 +394,22 @@ class AdbManager:
         scrcpy_height: int
     ) -> None:
         """
-        执行屏幕滑动操作（带坐标转换）
+        Execute screen swipe action (with coordinate conversion)
         
-        将 Scrcpy 视频流坐标转换为实际屏幕坐标后执行滑动。
+        Converts Scrcpy video stream coordinates to actual screen coordinates before swiping.
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            x1: 起始 X 坐标（Scrcpy 视频坐标）
-            y1: 起始 Y 坐标（Scrcpy 视频坐标）
-            x2: 结束 X 坐标（Scrcpy 视频坐标）
-            y2: 结束 Y 坐标（Scrcpy 视频坐标）
-            duration: 滑动持续时间（毫秒）
-            scrcpy_width: Scrcpy 视频宽度
-            scrcpy_height: Scrcpy 视频高度
+            container_id: Docker container ID or name
+            x1: Start X coordinate (Scrcpy video coordinates)
+            y1: Start Y coordinate (Scrcpy video coordinates)
+            x2: End X coordinate (Scrcpy video coordinates)
+            y2: End Y coordinate (Scrcpy video coordinates)
+            duration: Swipe duration (milliseconds)
+            scrcpy_width: Scrcpy video width
+            scrcpy_height: Scrcpy video height
             
         Raises:
-            HTTPException: 容器不存在或 ADB 连接失败
+            HTTPException: Container not found or ADB connection failed
         """
         real_x1, real_y1 = await self._convert_coordinates(
             container_id, x1, y1, scrcpy_width, scrcpy_height
@@ -323,158 +417,206 @@ class AdbManager:
         real_x2, real_y2 = await self._convert_coordinates(
             container_id, x2, y2, scrcpy_width, scrcpy_height
         )
+        logger.info(
+            "[AdbManager] SWIPE: video(%d,%d)->(%d,%d) @ %dx%d -> screen(%d,%d)->(%d,%d) | cmd: input swipe %d %d %d %d %d",
+            x1, y1, x2, y2, scrcpy_width, scrcpy_height, real_x1, real_y1, real_x2, real_y2, real_x1, real_y1, real_x2, real_y2, duration
+        )
         await self._execute(
             container_id,
             f"input swipe {real_x1} {real_y1} {real_x2} {real_y2} {duration}"
         )
     
+    async def long_press(
+        self,
+        container_id: str,
+        x: int,
+        y: int,
+        scrcpy_width: int,
+        scrcpy_height: int
+    ) -> None:
+        """
+        Execute screen long press action (with coordinate conversion)
+        
+        Android ADB has no direct long_press command, use input swipe to simulate:
+        Swipe with same start and end point for 1000ms (1 second) to simulate long press.
+        
+        Args:
+            container_id: Docker container ID or name
+            x: X coordinate (Scrcpy video coordinates)
+            y: Y coordinate (Scrcpy video coordinates)
+            scrcpy_width: Scrcpy video width
+            scrcpy_height: Scrcpy video height
+            
+        Raises:
+            HTTPException: Container not found or ADB connection failed
+        """
+        real_x, real_y = await self._convert_coordinates(
+            container_id, x, y, scrcpy_width, scrcpy_height
+        )
+        # Long press duration 1000ms (1 second)
+        await self._execute(
+            container_id,
+            f"input swipe {real_x} {real_y} {real_x} {real_y} 1000"
+        )
+    
     # =========================================================================
-    # 连接管理
+    # Connection Management
     # =========================================================================
     
     async def _get_or_connect(self, container_id: str) -> AdbDeviceTcpAsync:
         """
-        获取或创建 ADB 设备连接
+        Get or create ADB device connection
         
         Args:
-            container_id: Docker 容器 ID 或名称
+            container_id: Docker container ID or name
             
         Returns:
-            AdbDeviceTcpAsync: ADB 设备对象
+            AdbDeviceTcpAsync: ADB device object
             
         Raises:
-            HTTPException: 容器不存在或连接失败
+            HTTPException: Container not found or connection failed
         """
-        # 如果已有缓存连接，直接返回
+        # If cached connection exists, return directly
         if container_id in self._devices:
             return self._devices[container_id]
         
-        # 使用容器级别的锁防止并发握手踩踏
+        # Use container-level lock to prevent concurrent handshake collisions
         async with self._locks[container_id]:
-            # 双重检查：获取锁后再次确认连接是否已建立
+            # Double check: after acquiring lock, confirm connection again
             if container_id in self._devices:
                 return self._devices[container_id]
             
-            # 建立新连接
+            # Establish new connection
             await self._connect_device(container_id)
             return self._devices[container_id]
     
     async def _connect_device(self, container_id: str) -> None:
         """
-        建立与指定容器的 ADB TCP 连接
+        Establish ADB TCP connection with specified container
         
         Args:
-            container_id: Docker 容器 ID 或名称
+            container_id: Docker container ID or name
             
         Raises:
-            HTTPException: 容器不存在或连接失败
+            HTTPException: Container not found or connection failed
         """
         try:
-            # 获取宿主机上映射的外部端口
+            # Get host port mapped on host machine
             host_port = self._get_container_adb_port(container_id)
             
-            # 直接连接 localhost（Agent 与 Redroid 同机部署）
-            device = AdbDeviceTcpAsync(REDRoid_HOST, host_port)
+            # Ensure resolvable host address
+            target_host = self._resolve_host(REDROID_HOST)
             
-            # 连接设备（跳过 RSA 认证）
-            # 新版本 adb-shell 的 connect() 不接受参数
+            # Direct connection to localhost (Agent and Redroid deployed on same machine)
+            device = AdbDeviceTcpAsync(target_host, host_port)
+            
+            # Connect device (skip RSA auth)
+            # New version of adb-shell's connect() doesn't accept parameters
             await device.connect()
             
-            # 缓存连接
+            # Cache connection
             self._devices[container_id] = device
             
         except docker.errors.NotFound:
             raise HTTPException(
                 status_code=404,
-                detail=f"容器 {container_id} 不存在"
+                detail=f"Container {container_id} not found"
             )
         except socket.timeout:
             raise HTTPException(
                 status_code=504,
-                detail=f"ADB 连接超时：容器 {container_id} 的 {REDRoid_ADB_PORT}/tcp 端口无响应"
+                detail=f"ADB connection timeout: container {container_id}'s {REDROID_ADB_PORT}/tcp port not responding"
             )
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"ADB 连接失败: {str(e)}"
+                detail=f"ADB connection failed: {str(e)}"
             )
     
     def _get_container_adb_port(self, container_id: str) -> int:
         """
-        获取容器内部 5555/tcp 端口在宿主机上映射的实际端口
+        Get the actual port on host machine mapped from container's internal 5555/tcp port
         
-        由于 Agent 使用 host 网络模式，直接返回 5555。
-        只有在需要端口映射时才查询 Docker API。
+        Since Agent uses host network mode, returns 5555 directly.
+        Only queries Docker API when port mapping is needed.
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            
+            container_id: Docker container ID or name, or direct ADB connection identifiers like "localhost"/"default"
+        
         Returns:
-            int: 宿主机上映射的端口（host 模式下为 5555）
+            int: Port mapped on host machine (5555 in host mode)
         """
+        # If direct ADB connection identifier, don't query Docker API, return default port
+        if container_id in ("localhost", "default", "redroid"):
+            logger.info("[AdbManager] Using direct ADB connection identifier '%s', returning port %d", container_id, REDROID_ADB_PORT)
+            return REDROID_ADB_PORT
+        
         try:
-            # 首先检查 Docker socket 是否存在
+            # First check if Docker socket exists
             docker_socket = "/var/run/docker.sock"
             if not os.path.exists(docker_socket):
-                # Docker socket 不存在（host 网络模式），直接返回默认端口
-                logger.info(f"Docker socket 不存在，使用 host 网络模式，直接返回 {REDRoid_ADB_PORT}")
-                return REDRoid_ADB_PORT
+                # Docker socket not found (host network mode), return default port
+                logger.info("[AdbManager] Docker socket not found, using host network mode, returning %d", REDROID_ADB_PORT)
+                return REDROID_ADB_PORT
             
             client = docker.from_env()
             container = client.containers.get(container_id)
             
             ports = container.ports
-            container_port_str = f"{REDRoid_ADB_PORT}/tcp"
+            container_port_str = f"{REDROID_ADB_PORT}/tcp"
             
             if ports and container_port_str in ports:
                 host_bindings = ports[container_port_str]
                 if host_bindings and len(host_bindings) > 0:
-                    return int(host_bindings[0]["HostPort"])
+                    host_port = int(host_bindings[0]["HostPort"])
+                    logger.info("[AdbManager] Container '%s' ADB port mapping: %d -> %d", container_id, REDROID_ADB_PORT, host_port)
+                    return host_port
             
-            # 如果没有端口映射（host 网络模式），直接返回 5555
-            return REDRoid_ADB_PORT
+            # If no port mapping (host network mode), return 5555 directly
+            logger.info("[AdbManager] Container '%s' has no port mapping, using host network mode, returning %d", container_id, REDROID_ADB_PORT)
+            return REDROID_ADB_PORT
             
         except FileNotFoundError:
-            # Docker socket 不存在，假设使用 host 网络模式
-            logger.info(f"Docker socket 不存在，使用 host 网络模式，直接返回 {REDRoid_ADB_PORT}")
-            return REDRoid_ADB_PORT
+            # Docker socket not found, assume host network mode
+            logger.info("[AdbManager] Docker socket not found, using host network mode, returning %d", REDROID_ADB_PORT)
+            return REDROID_ADB_PORT
         except docker.errors.NotFound:
-            raise HTTPException(status_code=404, detail=f"容器 {container_id} 不存在")
+            raise HTTPException(status_code=404, detail=f"Container {container_id} not found")
         except HTTPException:
             raise
         except Exception as e:
-            # 如果是 Docker 连接错误，假设 host 网络模式
+            # If Docker connection error, assume host network mode
             if "docker" in str(e).lower() or "socket" in str(e).lower():
-                logger.info(f"Docker 连接失败 ({str(e)}), 使用 host 网络模式，返回 {REDRoid_ADB_PORT}")
-                return REDRoid_ADB_PORT
-            raise HTTPException(status_code=500, detail=f"获取容器端口映射失败: {str(e)}")
+                logger.info("[AdbManager] Docker connection failed (%s), using host network mode, returning %d", str(e), REDROID_ADB_PORT)
+                return REDROID_ADB_PORT
+            raise HTTPException(status_code=500, detail=f"Failed to get container port mapping: {str(e)}")
     
     async def _execute(self, container_id: str, command: str) -> str:
         """
-        在指定容器上执行 ADB Shell 命令
+        Execute ADB shell command on specified container
         
-        包含僵尸连接自愈机制：第一次失败后会自动剔除死连接并重试。
+        Includes zombie connection self-healing: first failure automatically removes dead connection and retries.
         
         Args:
-            container_id: Docker 容器 ID 或名称
-            command: 要执行的 shell 命令
+            container_id: Docker container ID or name
+            command: Shell command to execute
             
         Returns:
-            str: 命令执行结果
+            str: Command execution result
             
         Raises:
-            HTTPException: 容器不存在或命令执行失败
+            HTTPException: Container not found or command execution failed
         """
         device = await self._get_or_connect(container_id)
         
         for attempt in range(2):
             try:
-                # 执行 shell 命令
+                # Execute shell command
                 result = await asyncio.wait_for(
                     device.shell(command),
                     timeout=ADB_SHELL_TIMEOUT
                 )
-                # 处理 bytes 和 str 两种返回类型（不同 ADB 库版本可能不同）
+                # Handle both bytes and str return types (different ADB library versions)
                 if isinstance(result, bytes):
                     return result.decode("utf-8", errors="replace")
                 elif isinstance(result, str):
@@ -485,61 +627,98 @@ class AdbManager:
             except asyncio.TimeoutError:
                 raise HTTPException(
                     status_code=504,
-                    detail=f"ADB Shell 执行超时：{command}"
+                    detail=f"ADB Shell execution timeout: {command}"
                 )
             except (socket.error, ConnectionResetError, ConnectionRefusedError) as e:
-                # 捕获连接异常，进行自愈
+                # Catch connection exceptions, self-heal
                 self._devices.pop(container_id, None)
                 
                 if attempt == 0:
-                    # 第一次失败：剔除死连接并尝试重建
+                    # First failure: remove dead connection and try to rebuild
                     continue
                 else:
-                    # 第二次仍然失败
+                    # Second attempt also failed
                     raise HTTPException(
                         status_code=500,
-                        detail=f"ADB 连接已断开且无法重建: {str(e)}"
+                        detail=f"ADB connection dropped and cannot be rebuilt: {str(e)}"
                     )
             except Exception as e:
-                # 其他异常直接上报
+                # Other exceptions report directly
                 raise HTTPException(
                     status_code=500,
-                    detail=f"ADB Shell 执行失败: {str(e)}"
+                    detail=f"ADB Shell execution failed: {str(e)}"
                 )
         
         raise HTTPException(
             status_code=500,
-            detail="ADB 执行异常：未知错误"
+            detail="ADB execution exception: unknown error"
         )
     
     # =========================================================================
-    # 工具方法
+    # Utility Methods
     # =========================================================================
+    
+    @staticmethod
+    def _resolve_host(host: str) -> str:
+        """
+        Resolve hostname to IP address
+        
+        DNS resolution error [Errno -3] usually occurs in Docker container environments,
+        when using hostname (e.g., localhost) that cannot be resolved correctly.
+        This method resolves common hostnames to corresponding IP addresses.
+        
+        Args:
+            host: Original hostname (may need resolution)
+            
+        Returns:
+            str: Directly usable IP address or hostname
+        """
+        # If already an IP address, return directly
+        if host.replace(".", "").isdigit():
+            return host
+        
+        # Special handling for common hostnames
+        host_lower = host.lower()
+        
+        # localhost / 127.0.0.1
+        if host_lower in ("localhost", "localhost.localdomain", "host.docker.internal"):
+            logger.info("[AdbManager] Resolved hostname '%s' -> 127.0.0.1", host)
+            return "127.0.0.1"
+        
+        # Try DNS resolution
+        try:
+            result = socket.gethostbyname(host)
+            logger.info("[AdbManager] DNS resolved '%s' -> %s", host, result)
+            return result
+        except socket.gaierror as e:
+            # DNS resolution failed, fallback to original value
+            logger.warning("[AdbManager] DNS resolution '%s' failed: %s, using original value", host, e)
+            return host
     
     @staticmethod
     def _escape_shell_text(text: str) -> str:
         """
-        将文本转义为安全的 Shell 字符串
+        Escape text to safe shell string
         
-        采用单引号包裹 + 内部单引号转义的方式。
-        例如：I'm Bot -> 'I'\\''m Bot'
+        Uses single-quote wrapping + internal single-quote escaping.
+        Example: I'm Bot -> 'I'\\''m Bot'
         
         Args:
-            text: 原始文本
+            text: Original text
             
         Returns:
-            str: 转义后的安全字符串
+            str: Escaped safe string
         """
-        # 将内部单引号转义为 '\'' (单引号-反斜杠-单引号-单引号)
+        # Escape internal single quotes as '\'' (single quote - backslash - single quote - single quote)
         escaped = text.replace("'", "'\\''")
         return f"'{escaped}'"
     
     async def close(self, container_id: str) -> None:
         """
-        关闭指定容器的 ADB 连接
+        Close ADB connection for specified container
         
         Args:
-            container_id: Docker 容器 ID 或名称
+            container_id: Docker container ID or name
         """
         if container_id in self._devices:
             try:
@@ -550,20 +729,374 @@ class AdbManager:
                 self._devices.pop(container_id, None)
     
     async def close_all(self) -> None:
-        """关闭所有 ADB 连接"""
+        """Close all ADB connections"""
         for container_id in list(self._devices.keys()):
             await self.close(container_id)
+    
+    # =========================================================================
+    # APK Installation (Async Version)
+    # =========================================================================
+    
+    async def _run_adb_command(self, args: list[str], timeout: float = 120.0) -> tuple[int, str, str]:
+        """
+        Run ADB command (async version)
+        
+        Args:
+            args: adb command argument list
+            timeout: Timeout (seconds)
+            
+        Returns:
+            tuple[int, str, str]: (returncode, stdout, stderr)
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "adb", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return proc.returncode, stdout_bytes.decode("utf-8", errors="replace"), stderr_bytes.decode("utf-8", errors="replace")
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise asyncio.TimeoutError(f"ADB command timeout ({timeout}s): adb {' '.join(args)}")
+    
+    async def install_apk(self, container_id: str, apk_path: str) -> dict:
+        """
+        Install APK file to specified container (async version)
+        
+        Args:
+            container_id: Docker container ID or name
+            apk_path: Absolute path to APK file
+            
+        Returns:
+            dict: Dictionary containing success and message
+            
+        Raises:
+            AdbOperationError: Installation failed
+        """
+        logger.info("[APK Install] Starting APK installation: %s to container %s", apk_path, container_id)
+        
+        # Verify APK file exists
+        if not os.path.exists(apk_path):
+            raise AdbOperationError(f"APK file not found: {apk_path}")
+        
+        # Verify file size (APK usually larger than 1KB)
+        file_size = os.path.getsize(apk_path)
+        if file_size < 1024:
+            raise AdbOperationError(f"File too small, not a valid APK: {apk_path} ({file_size} bytes)")
+        
+        try:
+            # Dynamically get container's ADB port
+            adb_port = self._get_container_adb_port(container_id)
+            
+            # Step 1 - Connect device
+            returncode, stdout, stderr = await self._run_adb_command(
+                ["connect", f"localhost:{adb_port}"], timeout=10
+            )
+            logger.info("[APK Install] connect stdout: %s", stdout)
+            if stderr:
+                logger.info("[APK Install] connect stderr: %s", stderr)
+            
+            # Step 2 - Install APK (-r: replace existing app, -g: grant all runtime permissions)
+            returncode, stdout, stderr = await self._run_adb_command(
+                ["-s", f"localhost:{adb_port}", "install", "-r", "-g", apk_path], timeout=180
+            )
+            logger.info("[APK Install] install stdout: %s", stdout)
+            if stderr:
+                logger.info("[APK Install] install stderr: %s", stderr)
+            
+            # Check installation result
+            if returncode == 0 and "Success" in stdout:
+                logger.info("[APK Install] APK installation successful")
+                return {
+                    "success": True,
+                    "message": f"APK installation successful: {stdout.strip()}"
+                }
+            else:
+                error_msg = f"Installation failed: returncode={returncode}"
+                if stdout:
+                    error_msg += f", stdout={stdout}"
+                if stderr:
+                    error_msg += f", stderr={stderr}"
+                logger.error("[APK Install] %s", error_msg)
+                raise AdbOperationError(error_msg)
+                
+        except asyncio.TimeoutError as e:
+            logger.error("[APK Install] %s", e)
+            raise AdbOperationError(str(e))
+        except AdbOperationError:
+            raise
+        except Exception as e:
+            error_msg = f"APK installation failed: {e}"
+            logger.error("[APK Install] %s", error_msg)
+            raise AdbOperationError(error_msg)
+
+    async def install_xapk(self, container_id: str, xapk_path: str) -> dict:
+        """
+        Install XAPK file to specified container.
+
+        XAPK is ZIP format, containing one base APK and multiple split APKs.
+        Some apps (e.g., Chrome) need to install shared library before main app.
+
+        Installation strategies (in order):
+        1. Install shared libs first, then base+split APKs
+        2. Install all APKs together
+        3. Install non-shared APKs first, then shared libs
+
+        Args:
+            container_id: Docker container ID or name
+            xapk_path: Absolute path to XAPK file
+
+        Returns:
+            dict: Dictionary containing success and message
+
+        Raises:
+            AdbOperationError: Installation failed
+        """
+        import zipfile
+        import tempfile
+        import shutil
+
+        logger.info("[XAPK Install] Starting XAPK installation: %s to container %s", xapk_path, container_id)
+
+        temp_dir = None
+        try:
+            self._validate_xapk(xapk_path)
+            temp_dir, apk_files, main_package = self._extract_xapk(xapk_path)
+            shared_libs, base_apk, split_apks = self._classify_apks(apk_files, main_package)
+
+            adb_port = self._get_container_adb_port(container_id)
+            target = f"localhost:{adb_port}"
+
+            await self._run_adb_command(["connect", target], timeout=10)
+
+            if shared_libs:
+                result = await self._try_strategy_with_shared_libs(target, shared_libs, base_apk, split_apks, len(apk_files))
+                if result:
+                    return result
+
+            result = await self._try_strategy_all_together(target, apk_files, len(apk_files))
+            if result:
+                return result
+
+            if shared_libs:
+                result = await self._try_strategy_non_libs_first(target, shared_libs, base_apk, split_apks, len(apk_files))
+                if result:
+                    return result
+
+            raise AdbOperationError("XAPK installation failed after all strategies")
+
+        except AdbOperationError:
+            raise
+        except Exception as e:
+            raise AdbOperationError(f"XAPK installation failed: {e}")
+        finally:
+            if temp_dir:
+                self._cleanup_temp_dir(temp_dir)
+
+    def _validate_xapk(self, xapk_path: str) -> None:
+        """Validate XAPK file before extraction."""
+        if not os.path.exists(xapk_path):
+            raise AdbOperationError(f"XAPK file not found: {xapk_path}")
+
+        file_size = os.path.getsize(xapk_path)
+        if file_size < 1024:
+            raise AdbOperationError(f"File too small, not a valid XAPK: {xapk_path} ({file_size} bytes)")
+
+        if not zipfile.is_zipfile(xapk_path):
+            raise AdbOperationError(f"File is not valid ZIP format: {xapk_path}")
+
+    def _extract_xapk(self, xapk_path: str) -> tuple:
+        """
+        Extract XAPK and collect APK files and main package name.
+
+        Returns:
+            tuple: (temp_dir, apk_files list, main_package string)
+        """
+        import zipfile
+        import tempfile
+
+        temp_dir = tempfile.mkdtemp(prefix="outland_xapk_")
+        logger.info("[XAPK Install] Extracting to temp directory: %s", temp_dir)
+
+        with zipfile.ZipFile(xapk_path, "r") as zip_ref:
+            zip_ref.extractall(temp_dir)
+
+        apk_files: List[str] = []
+        main_package: str = ""
+
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                if file.endswith(".apk") and not file.endswith(".apk.orig"):
+                    apk_files.append(os.path.join(root, file))
+                elif file == "manifest.json":
+                    manifest_path = os.path.join(root, file)
+                    try:
+                        with open(manifest_path, "r", encoding="utf-8") as f:
+                            manifest_data = json.load(f)
+                        if isinstance(manifest_data, dict):
+                            main_package = manifest_data.get("package_name", "")
+                        logger.info("[XAPK Install] Parsed manifest.json, main package: %s", main_package)
+                    except Exception as e:
+                        logger.warning("[XAPK Install] Failed to parse manifest.json: %s", e)
+
+        if not apk_files:
+            raise AdbOperationError(f"No APK files found in XAPK: {xapk_path}")
+
+        logger.info("[XAPK Install] Found %d APK files", len(apk_files))
+        for apk in apk_files:
+            logger.info("[XAPK Install]   - %s", os.path.basename(apk))
+
+        return temp_dir, apk_files, main_package
+
+    def _classify_apks(self, apk_files: List[str], main_package: str) -> tuple:
+        """
+        Classify APK files into shared_libs, base_apk, and split_apks.
+
+        Returns:
+            tuple: (shared_libs list, base_apk string or None, split_apks list)
+        """
+        shared_libs: List[str] = []
+        base_apk: Optional[str] = None
+        split_apks: List[str] = []
+        main_pkg_short = main_package.split(".")[-1] if main_package else ""
+
+        for apk in apk_files:
+            apk_name = os.path.basename(apk)
+            apk_stem = apk_name.rsplit(".", 1)[0]
+
+            is_shared_lib = (
+                ("." in apk_stem or apk_name.startswith("com.") or apk_name.startswith("org.") or apk_name.startswith("android"))
+                and (main_pkg_short and apk_stem != main_pkg_short)
+            )
+
+            if is_shared_lib:
+                shared_libs.append(apk)
+                logger.info("[XAPK Install] Identified as shared library: %s", apk_name)
+            elif main_pkg_short and (apk_stem == main_pkg_short or apk_stem == main_package.replace(".", "_")):
+                base_apk = apk
+                logger.info("[XAPK Install] Identified as base APK: %s", apk_name)
+            else:
+                if main_package and apk_stem in main_package:
+                    base_apk = apk
+                    logger.info("[XAPK Install] Identified as base APK (fuzzy match): %s", apk_name)
+                else:
+                    split_apks.append(apk)
+                    logger.info("[XAPK Install] Identified as split APK: %s", apk_name)
+
+        if not base_apk and len(apk_files) > 0:
+            largest_apk = max(apk_files, key=lambda f: os.path.getsize(f))
+            if not any(largest_apk == lib for lib in shared_libs):
+                base_apk = largest_apk
+                logger.info("[XAPK Install] Identified as base APK (largest file): %s", os.path.basename(largest_apk))
+
+        logger.info("[XAPK Install] Classification: shared_libs=%d, base_apk=%s, split_apks=%d",
+                     len(shared_libs), os.path.basename(base_apk) if base_apk else "None", len(split_apks))
+
+        return shared_libs, base_apk, split_apks
+
+    async def _install_shared_libraries(self, target: str, shared_libs: List[str]) -> None:
+        """Install shared library APKs one by one."""
+        for lib_apk in shared_libs:
+            lib_name = os.path.basename(lib_apk)
+            logger.info("[XAPK Install] Installing shared library: %s", lib_name)
+            returncode, stdout, stderr = await self._run_adb_command(
+                ["-s", target, "install", "-r", "-g", lib_apk], timeout=120
+            )
+            if returncode == 0:
+                logger.info("[XAPK Install] Shared library installed successfully: %s", lib_name)
+            else:
+                logger.warning("[XAPK Install] Shared library installation failed, continuing: %s, stderr: %s", lib_name, stderr)
+
+    async def _install_apk_list(self, target: str, apk_list: List[str], description: str) -> tuple:
+        """
+        Install a list of APKs using install-multiple.
+
+        Returns:
+            tuple: (returncode, stdout, stderr)
+        """
+        if not apk_list:
+            return 0, "", ""
+
+        cmd_args = ["-s", target, "install-multiple", "-r", "-g"] + apk_list
+        logger.info("[XAPK Install] %s with install-multiple...", description)
+        returncode, stdout, stderr = await self._run_adb_command(cmd_args, timeout=300)
+        logger.info("[XAPK Install] stdout: %s", stdout)
+        if stderr:
+            logger.info("[XAPK Install] stderr: %s", stderr)
+        return returncode, stdout, stderr
+
+    async def _try_strategy_with_shared_libs(self, target: str, shared_libs: List[str], base_apk: Optional[str], split_apks: List[str], total_apks: int) -> Optional[dict]:
+        """Strategy 1: Install shared libs first, then base+split APKs."""
+        logger.info("[XAPK Install] Trying strategy 1: shared libs first...")
+
+        await self._install_shared_libraries(target, shared_libs)
+
+        remaining_apks = ([base_apk] if base_apk else []) + split_apks
+        if remaining_apks:
+            returncode, stdout, stderr = await self._install_apk_list(target, remaining_apks, "Installing base+split APKs")
+            if returncode == 0 and "Success" in stdout:
+                logger.info("[XAPK Install] XAPK installation successful")
+                return {"success": True, "message": f"XAPK installation successful, contains {total_apks} APKs"}
+
+        logger.warning("[XAPK Install] Strategy 1 failed, trying strategy 2...")
+        return None
+
+    async def _try_strategy_all_together(self, target: str, apk_files: List[str], total_apks: int) -> Optional[dict]:
+        """Strategy 2: Install all APKs together."""
+        logger.info("[XAPK Install] Trying strategy 2: all together...")
+
+        returncode, stdout, stderr = await self._install_apk_list(target, apk_files, "Installing all APKs")
+        if returncode == 0 and "Success" in stdout:
+            logger.info("[XAPK Install] XAPK installation successful")
+            return {"success": True, "message": f"XAPK installation successful, contains {total_apks} APKs"}
+
+        return None
+
+    async def _try_strategy_non_libs_first(self, target: str, shared_libs: List[str], base_apk: Optional[str], split_apks: List[str], total_apks: int) -> Optional[dict]:
+        """Strategy 3: Install non-shared-libs first, then shared libs."""
+        logger.info("[XAPK Install] Trying strategy 3: non-shared-libs first...")
+
+        non_lib_apks = ([base_apk] if base_apk else []) + split_apks
+        if not non_lib_apks:
+            return None
+
+        returncode, stdout, stderr = await self._install_apk_list(target, non_lib_apks, "Installing non-shared-lib APKs")
+        if returncode == 0 or "Success" in stdout:
+            logger.info("[XAPK Install] Non-shared-lib APKs installed, now trying with shared libs")
+            returncode, stdout, stderr = await self._install_apk_list(target, shared_libs, "Installing shared libs")
+            if returncode == 0 and "Success" in stdout:
+                logger.info("[XAPK Install] XAPK installation successful (strategy 3)")
+                return {"success": True, "message": f"XAPK installation successful, contains {total_apks} APKs"}
+
+        return None
+
+    def _cleanup_temp_dir(self, temp_dir: str) -> None:
+        """Clean up temporary directory."""
+        import shutil
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info("[XAPK Install] Cleaned up temp directory: %s", temp_dir)
+            except Exception:
+                pass
 
 
 # ============================================================================
-# 全局实例获取函数
+# Singleton accessor function
 # ============================================================================
+
+_adb_manager: Optional["AdbManager"] = None
 
 def get_adb_manager() -> AdbManager:
     """
-    获取 AdbManager 全局单例实例
+    Get global AdbManager instance (singleton)
     
     Returns:
-        AdbManager: ADB 管理器实例
+        AdbManager: Global manager instance
     """
-    return AdbManager()
+    global _adb_manager
+    if _adb_manager is None:
+        _adb_manager = AdbManager()
+    return _adb_manager

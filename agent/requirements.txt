@@ -18,3 +18,6 @@ adb-shell>=0.4.4
 httpx>=0.24.0
 aiofiles>=23.0.0
 async-timeout>=4.0.0
+
+# File Upload Support (for multipart form data)
+python-multipart>=0.0.6
