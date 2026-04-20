@@ -1,0 +1,55 @@
+# Outland Agent 服务
+# 部署在与 Redroid 相同的主机上
+services:
+  # ============================================
+  # Redroid 安卓容器
+  # ============================================
+  redroid:
+    image: redroid/redroid:11.0.0-latest
+    container_name: outland-redroid
+    privileged: true
+    command:
+      - androidboot.redroid_width=720
+      - androidboot.redroid_height=1280
+      - androidboot.redroid_fps=30
+      - androidboot.redroid_gpu_mode=guest
+      - androidboot.use_memfd=1
+    restart: unless-stopped
+    # 绝不能使用 host 网络，Android init 需要独立的网络命名空间来监听 UEVENT
+    ports:
+      - "5555:5555"  # ADB 直连端口
+    volumes:
+      - redroid-data:/data
+      - /dev/binderfs:/dev/binderfs
+
+  # ============================================
+  # Outland Agent 服务（包含 ADB Server）
+  # ============================================
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: outland-agent
+    # 使用 host 网络模式，WebRTC 需要 UDP 直通
+    # 同时可以访问 redroid 容器（通过 Docker 内部网络或宿主机端口 5555）
+    network_mode: "host"
+    environment:
+      # ADB Server 在本容器内运行
+      - ADB_SERVER_HOST=127.0.0.1
+      - ADB_SERVER_PORT=5037
+      # Redroid 通过 Docker 内部网络或端口映射访问
+      - REDROID_HOST=127.0.0.1
+      - REDROID_ADB_PORT=5555
+      - SDL_VIDEODRIVER=dummy
+      - SCRCPY_SERVER_PATH=/usr/local/bin/scrcpy-server
+    volumes:
+      # 挂载 Docker Socket 以管理容器
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    depends_on:
+      - redroid
+
+# 数据卷
+volumes:
+  redroid-data:
+    driver: local

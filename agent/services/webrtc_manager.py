@@ -1,5 +1,5 @@
 """
-Outland Backend - WebRTC Manager
+Outland Agent - WebRTC Manager
 
 提供 WebRTC 连接管理，处理视频推流和控制信令。
 
@@ -9,13 +9,13 @@ Outland Backend - WebRTC Manager
 - 通过 DataChannel 接收控制指令并转发到 AdbManager
 
 技术要点：
-- 使用 STUN 服务器配置解决公网 NAT 穿透问题
+- 使用 STUN 服务器配置解决公网 NAT 穿透问题（可选）
 - DataChannel 回调中使用 asyncio.create_task() 调用异步 AdbManager 方法
 - 一个容器可被多个客户端同时观看
 
 部署说明：
-- Docker 部署建议使用 network_mode: "host" 以确保 UDP 媒体流顺利打通
-- 或在 NAS 路由器上配置 DMZ/UPnP
+- Agent 使用 network_mode: "host" 确保 UDP 媒体流顺利打通
+- 本地部署时不需要 STUN 服务器
 """
 
 import asyncio
@@ -33,7 +33,39 @@ from aiortc.contrib.media import MediaRelay
 
 from fastapi import HTTPException
 
-from backend.services.adb_client import get_adb_manager, AdbManager
+from services.adb_client import get_adb_manager, AdbManager
+
+
+# ============================================================================
+# AIORTC / AIOICE Monkey Patch
+# ============================================================================
+# 修复 Linux Docker 下 ifaddr 获取物理网卡失败导致 UDP 无法绑定的致命 Bug
+# 
+# 问题原因：
+# aioice 库使用 ifaddr.get_adapters() 获取本地 IP，但 Docker 容器中可能无法
+# 正确获取物理网卡的 IP（返回空列表），导致 UDP Socket 无法绑定，无 candidate 生成。
+#
+# 修复方案：
+# Patch aioice.ice.get_host_addresses 函数，在原有地址列表为空时添加 "0.0.0.0"
+# 作为 fallback，使 aiortc 能在全网卡成功建立 UDP Socket 绑定。
+import aioice.ice
+_original_get_host_addresses = aioice.ice.get_host_addresses
+
+def patched_get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
+    """
+    获取本地 IP 地址列表，修复 Docker 容器中 ifaddr 获取失败的问题。
+    
+    当 ifaddr 无法获取物理网卡 IP 时，添加 "0.0.0.0" 作为 fallback，
+    使 aiortc 能成功创建 UDP Socket 并生成 ICE candidates。
+    """
+    addresses = _original_get_host_addresses(use_ipv4, use_ipv6)
+    if not addresses:
+        # 关键修复：当 ifaddr 返回空列表时，添加 "0.0.0.0" fallback
+        # 这样 aiortc 能在全网卡绑定 UDP Socket，保证 ICE candidates 生成
+        addresses.append("0.0.0.0")
+    return addresses
+
+aioice.ice.get_host_addresses = patched_get_host_addresses
 
 
 class WebRTCManager:
@@ -80,7 +112,7 @@ class WebRTCManager:
         """
         处理 WebRTC Offer 并返回 Answer
         
-        创建 RTCPeerConnection，配置 STUN 服务器，添加视频轨道，
+        创建 RTCPeerConnection，配置 STUN 服务器（可选），添加视频轨道，
         设置控制信令通道，并生成 SDP Answer。
         
         Args:
@@ -105,11 +137,17 @@ class WebRTCManager:
             adb_port = adb_manager._get_container_adb_port(container_id)
             print(f"[WebRTC] 获取到 ADB 端口: {adb_port}")
             
-            
-            # 创建 RTCPeerConnection
-            # 本地部署不需要 STUN 服务器
-            # 如需公网部署，可在此添加 iceServers 配置
-            pc = RTCPeerConnection()
+            # 必须使用国内可用的 STUN 服务器！
+            # 否则 Ubuntu Docker(host模式) 下 aiortc 会因为找不到默认路由引发 bug，导致一条 a=candidate 都不生成。
+            # 这里使用了小米和 B 站的免费开源 STUN 服务器，完美解决国内网络不通和 ICE 为空的问题。
+            pc = RTCPeerConnection(
+                configuration=RTCConfiguration(
+                    iceServers=[
+                        RTCIceServer(urls=["stun:stun.miwifi.com:3478"]),
+                        RTCIceServer(urls=["stun:stun.chat.bilibili.com:3478"])
+                    ]
+                )
+            )
             
             # 初始化连接记录
             if container_id not in self._connections:
@@ -117,7 +155,7 @@ class WebRTCManager:
             self._connections[container_id].add(pc)
             
             # 导入 ScrcpyTrack（延迟导入避免循环依赖）
-            from backend.services.scrcpy_track import ScrcpyTrack
+            from services.scrcpy_track import ScrcpyTrack
             
             # 创建视频轨道（如果还没有为这个容器创建）
             if container_id not in self._tracks:
@@ -130,38 +168,70 @@ class WebRTCManager:
             
             # 使用 MediaRelay 复用视频流
             # 这样多个客户端可以观看同一个容器的视频
-            relayed_track = self._relay.subscribe(self._tracks[container_id])
+            source_track = self._tracks[container_id]
+            relayed_track = self._relay.subscribe(source_track)
             
-            # 添加视频轨道到连接
-            pc.addTrack(relayed_track)
+            print(f"[WebRTC] 源轨道类型: {type(source_track)}, 转发轨道类型: {type(relayed_track)}")
             
-            # 设置 DataChannel 处理
+            # 先处理 SDP Offer，设置远端描述
+            # 关键：必须在添加轨道之前设置远端描述，以便 aiortc 正确进行编解码器协商
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=offer_type))
+            print(f"[WebRTC] SDP Offer 已设置")
+            
+            # 设置 DataChannel 处理（必须在 setRemoteDescription 之后）
             await self._setup_datachannel(pc, container_id)
             
             # 设置连接关闭处理
             self._setup_connection_close(pc, container_id)
             
-            # 处理 SDP Offer
-            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=offer_type))
+            # 添加视频轨道到连接
+            # 重要：addTrack 必须在 setRemoteDescription 之后调用
+            # 这样 aiortc 才能正确将轨道与远端协商的编解码器关联
+            pc.addTrack(relayed_track)
+            print(f"[WebRTC] 已添加视频轨道到 RTCPeerConnection")
             
-            # 创建 SDP Answer
+            print(f"[WebRTC] SDP Offer 已设置，开始创建 Answer...")
+
+            # 注意：必须先创建并发出 Answer，ICE 协商才能开始！
+            # 不能在 createAnswer 之前等待 ICE connected（否则是死锁）。
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
+            print(f"[WebRTC] SDP Answer 已创建并设置为本地描述")
             
-            # 直接返回 answer，而不是 pc.localDescription
-            # 避免 aiortc 内部序列化时可能出现的问题
-            return answer
+            # 必须等待 ICE Candidate 收集完成，否则本地 SDP 中没有物理 IP，前端无法直连
+            gathering_complete = asyncio.Event()
+            
+            @pc.on("icegatheringstatechange")
+            def on_icegatheringstatechange():
+                if pc.iceGatheringState == "complete":
+                    gathering_complete.set()
+                    
+            if pc.iceGatheringState != "complete":
+                try:
+                    await asyncio.wait_for(gathering_complete.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    print(f"[WebRTC] ICE 收集超时，尝试返回已有 SDP")
+            
+            # 返回包含完整 candidate 列表的 localDescription
+            return pc.localDescription
             
         except Exception as e:
             import traceback
-            print(f"[WebRTC] 发生异常: {e}")
+            import sys
+            print(f"[WebRTC] 发生异常: {type(e).__name__}: {e}")
             print(f"[WebRTC] 完整 traceback:")
-            traceback.print_exc()
+            exc_type, exc_value, exc_tb = sys.exc_info()
+            if exc_tb:
+                import traceback as tb_module
+                tb_list = tb_module.extract_tb(exc_tb)
+                for frame in tb_list:
+                    print(f"  File '{frame.filename}', line {frame.lineno}, in {frame.name}")
+                    print(f"    {frame.line}")
             # 清理失败的连接
             await self._cleanup_connection(pc, container_id)
             raise HTTPException(
                 status_code=500,
-                detail=f"WebRTC 连接建立失败: {str(e)}"
+                detail=f"WebRTC 连接建立失败: {type(e).__name__}: {str(e)}"
             )
     
     async def _setup_datachannel(self, pc: RTCPeerConnection, container_id: str) -> None:

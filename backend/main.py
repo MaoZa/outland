@@ -91,10 +91,6 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown: 清理资源
     print("[Outland] Backend shutting down...")
-    
-    # 关闭 WebRTC 管理器，释放所有连接和子进程
-    from backend.services.webrtc_manager import shutdown_webrtc_manager
-    await shutdown_webrtc_manager()
 
 
 app = FastAPI(
@@ -127,7 +123,6 @@ app.add_middleware(
 # ============================================================================
 
 from backend.routers import automation, stream
-from backend.services.webrtc_manager import shutdown_webrtc_manager
 
 app.include_router(automation.router, prefix="/api/action", tags=["Automation"])
 app.include_router(stream.router, prefix="/api/stream", tags=["Stream"])

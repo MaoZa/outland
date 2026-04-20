@@ -114,3 +114,5 @@ Thumbs.db
 backend/__pycache__/
 backend/*.pyc
 backend/*.pyo
+/frontend/node_modules/
+/frontend/.next/

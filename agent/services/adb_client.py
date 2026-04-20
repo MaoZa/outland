@@ -1,46 +1,50 @@
 """
-Outland Backend - ADB Client Manager
+Outland Agent - ADB Client Manager
 
 提供与 Redroid 容器的异步 ADB 连接管理。
 采用 adb-shell[async] 库直接通过 TCP 协议控制安卓设备。
 
-核心特性：
+核心特性（简化版 - 本地部署）：
 - 单例模式：全局唯一的 AdbManager 实例
 - 连接缓存：复用 ADB TCP 连接，避免重复握手
-- RSA 认证：自动生成临时 RSA 密钥对
-- 僵尸自愈：连接失败后自动剔除并重建
-- 握手锁：防止并发握手踩踏
-- Shell 注入防护：文本输入严格转义
+- 简化的端口发现：直接使用 5555 端口
 """
 
 import asyncio
 import collections
+import logging
+import os
 import socket
 from typing import Dict, Optional
 
 import docker
 from adb_shell.adb_device_async import AdbDeviceTcpAsync
-from adb_shell.auth.sign_pythonrsa import PythonRSASigner
 
 from fastapi import HTTPException
+
+# 配置日志
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
 # 常量定义
 # ============================================================================
 
-# Redroid 容器的 ADB 服务端口（容器内部）
-REDRoid_ADB_PORT: int = 5555
+# ADB Server 配置（从环境变量读取）
+ADB_SERVER_HOST: str = os.environ.get("ADB_SERVER_HOST", "127.0.0.1")
+ADB_SERVER_PORT: int = int(os.environ.get("ADB_SERVER_PORT", "5037"))
+
+# Redroid 主机地址
+REDRoid_HOST: str = os.environ.get("REDROID_HOST", "127.0.0.1")
+
+# Redroid 容器的 ADB 服务端口
+REDRoid_ADB_PORT: int = int(os.environ.get("REDROID_ADB_PORT", "5555"))
 
 # ADB 连接超时时间（秒）
 ADB_CONNECT_TIMEOUT: float = 10.0
 
 # ADB Shell 执行超时时间（秒）
 ADB_SHELL_TIMEOUT: float = 5.0
-
-# Redroid 主机名（支持远程部署，从环境变量读取）
-import os as _os
-REDRoid_HOST: str = _os.environ.get("REDROID_HOST", "redroid")
 
 
 # ============================================================================
@@ -66,12 +70,12 @@ class AdbManager:
     ADB 设备管理器（单例模式）
     
     负责管理与所有安卓容器的异步 ADB 连接。
+    简化版：直接连接 localhost:5555
     
     Attributes:
         _instance: 单例实例
         _devices: 设备连接缓存字典，以 container_id 为键
         _locks: 每个容器的异步锁字典，防止并发握手踩踏
-        _rsa_signer: RSA 认证签名器（内存中自动生成）
     """
     
     _instance: Optional["AdbManager"] = None
@@ -86,18 +90,12 @@ class AdbManager:
     def __init__(self) -> None:
         """
         初始化 AdbManager
-        
-        如果本地没有 RSA 密钥，自动在内存中生成一对临时密钥。
         """
         if self._initialized:
             return
         
         self._devices: Dict[str, AdbDeviceTcpAsync] = {}
         self._locks: Dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
-        
-        # 暂时不使用 RSA 认证，跳过初始化
-        # self._rsa_signer = None
-        
         self._initialized = True
     
     # =========================================================================
@@ -221,14 +219,21 @@ class AdbManager:
         try:
             # 获取宿主机上映射的外部端口
             host_port = self._get_container_adb_port(container_id)
-            host_ip = self._get_host_ip()
             
-            device = AdbDeviceTcpAsync(host_ip, host_port)
+            # 直接连接 localhost（Agent 与 Redroid 同机部署）
+            device = AdbDeviceTcpAsync(REDRoid_HOST, host_port)
             
-            # 跳过 RSA 认证，直接连接
-            await device.connect(
-                auth_timeout_ms=int(ADB_CONNECT_TIMEOUT * 1000)
-            )
+            # 连接设备（跳过 RSA 认证）
+            # 注意：不同版本的 adb-shell 库参数名称不同
+            try:
+                await device.connect(
+                    auth_timeout_ms=int(ADB_CONNECT_TIMEOUT * 1000)
+                )
+            except TypeError:
+                # 旧版本 adb-shell 使用 timeout 参数
+                await device.connect(
+                    timeout=ADB_CONNECT_TIMEOUT
+                )
             
             # 缓存连接
             self._devices[container_id] = device
@@ -252,30 +257,24 @@ class AdbManager:
     def _get_container_adb_port(self, container_id: str) -> int:
         """
         获取容器内部 5555/tcp 端口在宿主机上映射的实际端口
-        优先通过远程 Agent 查询，否则回退本地 Docker。
+        
+        由于 Agent 使用 host 网络模式，直接返回 5555。
+        只有在需要端口映射时才查询 Docker API。
+        
+        Args:
+            container_id: Docker 容器 ID 或名称
+            
+        Returns:
+            int: 宿主机上映射的端口（host 模式下为 5555）
         """
-        import os
-        agent_url = os.environ.get("AGENT_URL")
-        
-        # ---- 远程 Agent 模式 ----
-        if agent_url:
-            import httpx
-            try:
-                resp = httpx.get(
-                    f"{agent_url}/api/container/{container_id}/adb_port",
-                    timeout=10.0
-                )
-                resp.raise_for_status()
-                return resp.json()["port"]
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    raise HTTPException(status_code=404, detail=f"容器 {container_id} 不存在")
-                raise HTTPException(status_code=502, detail=f"Agent 返回错误: {e.response.text}")
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"无法连接 Agent: {str(e)}")
-        
-        # ---- 本地 Docker 模式 ----
         try:
+            # 首先检查 Docker socket 是否存在
+            docker_socket = "/var/run/docker.sock"
+            if not os.path.exists(docker_socket):
+                # Docker socket 不存在（host 网络模式），直接返回默认端口
+                logger.info(f"Docker socket 不存在，使用 host 网络模式，直接返回 {REDRoid_ADB_PORT}")
+                return REDRoid_ADB_PORT
+            
             client = docker.from_env()
             container = client.containers.get(container_id)
             
@@ -287,46 +286,23 @@ class AdbManager:
                 if host_bindings and len(host_bindings) > 0:
                     return int(host_bindings[0]["HostPort"])
             
-            raise HTTPException(
-                status_code=500,
-                detail=f"容器 {container_id} 未暴露 {REDRoid_ADB_PORT}/tcp 端口"
-            )
+            # 如果没有端口映射（host 网络模式），直接返回 5555
+            return REDRoid_ADB_PORT
             
+        except FileNotFoundError:
+            # Docker socket 不存在，假设使用 host 网络模式
+            logger.info(f"Docker socket 不存在，使用 host 网络模式，直接返回 {REDRoid_ADB_PORT}")
+            return REDRoid_ADB_PORT
         except docker.errors.NotFound:
             raise HTTPException(status_code=404, detail=f"容器 {container_id} 不存在")
         except HTTPException:
             raise
         except Exception as e:
+            # 如果是 Docker 连接错误，假设 host 网络模式
+            if "docker" in str(e).lower() or "socket" in str(e).lower():
+                logger.info(f"Docker 连接失败 ({str(e)}), 使用 host 网络模式，返回 {REDRoid_ADB_PORT}")
+                return REDRoid_ADB_PORT
             raise HTTPException(status_code=500, detail=f"获取容器端口映射失败: {str(e)}")
-    
-    def _get_host_ip(self) -> str:
-        """
-        获取宿主机的 IP 地址
-        """
-        import os
-        # 如果在 Docker 中运行，宿主机的映射端口可以通过 Docker 默认网关访问
-        if os.path.exists("/.dockerenv"):
-            try:
-                import socket, struct
-                with open("/proc/net/route") as fh:
-                    for line in fh:
-                        fields = line.strip().split()
-                        if fields[1] != '00000000' or not int(fields[3], 16) & 2:
-                            continue
-                        return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
-            except Exception:
-                return "host.docker.internal"
-        
-        # 兜底：本地原生运行时
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            host_ip = s.getsockname()[0]
-            s.close()
-            return host_ip
-        except Exception:
-            return "127.0.0.1"
     
     async def _execute(self, container_id: str, command: str) -> str:
         """
@@ -395,7 +371,7 @@ class AdbManager:
         将文本转义为安全的 Shell 字符串
         
         采用单引号包裹 + 内部单引号转义的方式。
-        例如：I'm Bot -> 'I'\''m Bot'
+        例如：I'm Bot -> 'I'\\''m Bot'
         
         Args:
             text: 原始文本
