@@ -39,6 +39,8 @@ interface ControlAction {
   duration?: number
   text?: string
   keycode?: number
+  video_width?: number
+  video_height?: number
 }
 
 // ============================================================================
@@ -53,7 +55,7 @@ const ANDROID_HEIGHT = 1280
 // WebRTCPlayer Component
 // ============================================================================
 
-export default function WebRTCPlayer({ containerId, onTextInput }: WebRTCPlayerProps) {
+export default function WebRTCPlayer({ containerId }: WebRTCPlayerProps) {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
@@ -66,56 +68,51 @@ export default function WebRTCPlayer({ containerId, onTextInput }: WebRTCPlayerP
   const [error, setError] = useState<string | null>(null)
   const [showTextModal, setShowTextModal] = useState(false)
   const [textInput, setTextInput] = useState('')
+  // 视频分辨率（从后端获取）
+  const [videoWidth, setVideoWidth] = useState(ANDROID_WIDTH)
+  const [videoHeight, setVideoHeight] = useState(ANDROID_HEIGHT)
 
   // ============================================================================
   // Coordinate Mapping Function
   // ============================================================================
 
-  /**
-   * 将浏览器坐标转换为安卓原生坐标
-   * 
-   * 算法说明：
-   * 1. 获取视频在浏览器中的显示尺寸 (getBoundingClientRect)
-   * 2. 获取视频原始分辨率 (videoWidth/videoHeight)
-   * 3. 计算 object-fit: contain 产生的黑边偏移
-   * 4. 应用缩放比例得到安卓坐标
-   */
   const clientToAndroid = useCallback(
     (clientX: number, clientY: number): { x: number; y: number } => {
       const video = videoRef.current
       if (!video) return { x: 0, y: 0 }
 
       const rect = video.getBoundingClientRect()
-      const videoWidth = video.videoWidth || ANDROID_WIDTH
-      const videoHeight = video.videoHeight || ANDROID_HEIGHT
+      // 优先使用后端配置的分辨率（已知准确值）
+      // 其次使用 video 元素的实际分辨率
+      // 最后使用默认值
+      const actualWidth = videoWidth > 0 ? videoWidth : (video.videoWidth || ANDROID_WIDTH)
+      const actualHeight = videoHeight > 0 ? videoHeight : (video.videoHeight || ANDROID_HEIGHT)
 
       // 计算视频在容器中的实际显示尺寸（考虑 object-fit: contain）
       const containerWidth = rect.width
       const containerHeight = rect.height
 
       // 计算缩放比例（取较小的值以保持宽高比）
-      const scaleX = videoWidth / containerWidth
-      const scaleY = videoHeight / containerHeight
+      const scaleX = actualWidth / containerWidth
+      const scaleY = actualHeight / containerHeight
 
       // 计算黑边偏移（居中时）
-      const displayWidth = containerWidth
-      const displayHeight = containerHeight
-      const scaledWidth = videoWidth / scaleX
-      const scaledHeight = videoHeight / scaleY
-      const offsetX = (displayWidth - scaledWidth) / 2
-      const offsetY = (displayHeight - scaledHeight) / 2
+      const scaledWidth = actualWidth / scaleX
+      const scaledHeight = actualHeight / scaleY
+      const offsetX = (containerWidth - scaledWidth) / 2
+      const offsetY = (containerHeight - scaledHeight) / 2
 
       // 转换坐标
       const androidX = Math.round((clientX - rect.left - offsetX) * scaleX)
       const androidY = Math.round((clientY - rect.top - offsetY) * scaleY)
 
-      // 边界检查
+      // 边界检查（使用实际分辨率）
       return {
-        x: Math.max(0, Math.min(androidX, ANDROID_WIDTH)),
-        y: Math.max(0, Math.min(androidY, ANDROID_HEIGHT)),
+        x: Math.max(0, Math.min(androidX, actualWidth)),
+        y: Math.max(0, Math.min(androidY, actualHeight)),
       }
     },
-    []
+    [videoWidth, videoHeight]
   )
 
   // ============================================================================
@@ -192,6 +189,9 @@ export default function WebRTCPlayer({ containerId, onTextInput }: WebRTCPlayerP
 
         dataChannel.onopen = () => {
           console.log('[WebRTCPlayer] DataChannel 已打开')
+          // 请求分辨率配置
+          dataChannel.send(JSON.stringify({ action: 'config' }))
+          console.log('[WebRTCPlayer] 已发送配置请求')
         }
 
         dataChannel.onclose = () => {
@@ -200,6 +200,21 @@ export default function WebRTCPlayer({ containerId, onTextInput }: WebRTCPlayerP
 
         dataChannel.onerror = (err) => {
           console.error('[WebRTCPlayer] DataChannel 错误:', err)
+        }
+
+        // 监听后端发送的消息（如分辨率配置）
+        dataChannel.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data)
+            if (data.type === 'config') {
+              // 更新视频分辨率
+              setVideoWidth(data.width || ANDROID_WIDTH)
+              setVideoHeight(data.height || ANDROID_HEIGHT)
+              console.log('[WebRTCPlayer] 收到分辨率配置:', data.width, 'x', data.height)
+            }
+          } catch (e) {
+            console.warn('[WebRTCPlayer] 解析 DataChannel 消息失败:', e)
+          }
         }
 
         // 监听视频轨道
@@ -235,6 +250,7 @@ export default function WebRTCPlayer({ containerId, onTextInput }: WebRTCPlayerP
         }
 
         // 设置远端描述
+        // answer.type 是 string，需要转换为 RTCSdpType
         await pc.setRemoteDescription({
           sdp: answer.sdp,
           type: answer.type as RTCSdpType,
@@ -281,13 +297,14 @@ export default function WebRTCPlayer({ containerId, onTextInput }: WebRTCPlayerP
     (e: React.PointerEvent<HTMLVideoElement>) => {
       e.preventDefault()
       const { x, y } = clientToAndroid(e.clientX, e.clientY)
-      sendControlAction({ action: 'click', x, y })
+      // 发送 click 动作时附带视频分辨率，让后端进行坐标转换
+      sendControlAction({ action: 'click', x, y, video_width: videoWidth, video_height: videoHeight })
     },
-    [clientToAndroid, sendControlAction]
+    [clientToAndroid, sendControlAction, videoWidth, videoHeight]
   )
 
   const handlePointerMove = useCallback(
-    (e: React.PointerEvent<HTMLVideoElement>) => {
+    (_e: React.PointerEvent<HTMLVideoElement>) => {
       // 如果需要拖拽支持，可以在这里实现
       // 目前主要用于调试
     },

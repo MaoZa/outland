@@ -76,6 +76,7 @@ class AdbManager:
         _instance: 单例实例
         _devices: 设备连接缓存字典，以 container_id 为键
         _locks: 每个容器的异步锁字典，防止并发握手踩踏
+        _screen_sizes: 缓存每个容器的实际屏幕分辨率
     """
     
     _instance: Optional["AdbManager"] = None
@@ -97,6 +98,8 @@ class AdbManager:
         self._devices: Dict[str, AdbDeviceTcpAsync] = {}
         self._locks: Dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
         self._initialized = True
+        # 缓存每个容器的实际屏幕分辨率
+        self._screen_sizes: Dict[str, tuple[int, int]] = {}
     
     # =========================================================================
     # 公开 API：底层动作封装
@@ -176,6 +179,156 @@ class AdbManager:
         await self._execute(container_id, f"input keyevent {keycode}")
     
     # =========================================================================
+    # 屏幕分辨率和坐标转换
+    # =========================================================================
+    
+    async def get_screen_size(self, container_id: str) -> tuple[int, int]:
+        """
+        获取容器的实际屏幕分辨率
+        
+        使用 `wm size` 命令获取物理屏幕分辨率。
+        结果会被缓存以提高性能。
+        
+        Args:
+            container_id: Docker 容器 ID 或名称
+            
+        Returns:
+            tuple[int, int]: (宽度, 高度)
+        """
+        # 检查缓存
+        if container_id in self._screen_sizes:
+            return self._screen_sizes[container_id]
+        
+        # 执行 wm size 命令
+        result = await self._execute(container_id, "wm size")
+        
+        # 解析输出，如 "Physical size: 720x1280"
+        import re
+        match = re.search(r"Physical size:\s*(\d+)x(\d+)", result)
+        if match:
+            width = int(match.group(1))
+            height = int(match.group(2))
+        else:
+            # 默认值
+            width = 720
+            height = 1280
+        
+        # 缓存结果
+        self._screen_sizes[container_id] = (width, height)
+        logger.info(f"[AdbManager] 屏幕分辨率 {container_id}: {width}x{height}")
+        return (width, height)
+    
+    async def _convert_coordinates(
+        self,
+        container_id: str,
+        x: int,
+        y: int,
+        scrcpy_width: int,
+        scrcpy_height: int
+    ) -> tuple[int, int]:
+        """
+        将 Scrcpy 视频流坐标转换为实际屏幕坐标
+        
+        由于 Scrcpy 视频流可能经过缩放，需要将触摸坐标从视频分辨率
+        转换为实际屏幕分辨率。
+        
+        Args:
+            container_id: Docker 容器 ID 或名称
+            x: Scrcpy 视频中的 X 坐标
+            y: Scrcpy 视频中的 Y 坐标
+            scrcpy_width: Scrcpy 视频宽度
+            scrcpy_height: Scrcpy 视频高度
+            
+        Returns:
+            tuple[int, int]: (实际屏幕 X, 实际屏幕 Y)
+        """
+        screen_width, screen_height = await self.get_screen_size(container_id)
+        
+        # 计算缩放比例
+        scale_x = screen_width / scrcpy_width
+        scale_y = screen_height / scrcpy_height
+        
+        # 转换坐标
+        real_x = int(x * scale_x)
+        real_y = int(y * scale_y)
+        
+        logger.debug(
+            f"[AdbManager] 坐标转换 {container_id}: "
+            f"({x}, {y}) @ {scrcpy_width}x{scrcpy_height} → "
+            f"({real_x}, {real_y}) @ {screen_width}x{screen_height}"
+        )
+        
+        return (real_x, real_y)
+    
+    async def tap_with_conversion(
+        self,
+        container_id: str,
+        x: int,
+        y: int,
+        scrcpy_width: int,
+        scrcpy_height: int
+    ) -> None:
+        """
+        执行屏幕点击操作（带坐标转换）
+        
+        将 Scrcpy 视频流坐标转换为实际屏幕坐标后执行点击。
+        
+        Args:
+            container_id: Docker 容器 ID 或名称
+            x: Scrcpy 视频中的 X 坐标
+            y: Scrcpy 视频中的 Y 坐标
+            scrcpy_width: Scrcpy 视频宽度
+            scrcpy_height: Scrcpy 视频高度
+            
+        Raises:
+            HTTPException: 容器不存在或 ADB 连接失败
+        """
+        real_x, real_y = await self._convert_coordinates(
+            container_id, x, y, scrcpy_width, scrcpy_height
+        )
+        await self._execute(container_id, f"input tap {real_x} {real_y}")
+    
+    async def swipe_with_conversion(
+        self,
+        container_id: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        duration: int,
+        scrcpy_width: int,
+        scrcpy_height: int
+    ) -> None:
+        """
+        执行屏幕滑动操作（带坐标转换）
+        
+        将 Scrcpy 视频流坐标转换为实际屏幕坐标后执行滑动。
+        
+        Args:
+            container_id: Docker 容器 ID 或名称
+            x1: 起始 X 坐标（Scrcpy 视频坐标）
+            y1: 起始 Y 坐标（Scrcpy 视频坐标）
+            x2: 结束 X 坐标（Scrcpy 视频坐标）
+            y2: 结束 Y 坐标（Scrcpy 视频坐标）
+            duration: 滑动持续时间（毫秒）
+            scrcpy_width: Scrcpy 视频宽度
+            scrcpy_height: Scrcpy 视频高度
+            
+        Raises:
+            HTTPException: 容器不存在或 ADB 连接失败
+        """
+        real_x1, real_y1 = await self._convert_coordinates(
+            container_id, x1, y1, scrcpy_width, scrcpy_height
+        )
+        real_x2, real_y2 = await self._convert_coordinates(
+            container_id, x2, y2, scrcpy_width, scrcpy_height
+        )
+        await self._execute(
+            container_id,
+            f"input swipe {real_x1} {real_y1} {real_x2} {real_y2} {duration}"
+        )
+    
+    # =========================================================================
     # 连接管理
     # =========================================================================
     
@@ -224,16 +377,8 @@ class AdbManager:
             device = AdbDeviceTcpAsync(REDRoid_HOST, host_port)
             
             # 连接设备（跳过 RSA 认证）
-            # 注意：不同版本的 adb-shell 库参数名称不同
-            try:
-                await device.connect(
-                    auth_timeout_ms=int(ADB_CONNECT_TIMEOUT * 1000)
-                )
-            except TypeError:
-                # 旧版本 adb-shell 使用 timeout 参数
-                await device.connect(
-                    timeout=ADB_CONNECT_TIMEOUT
-                )
+            # 新版本 adb-shell 的 connect() 不接受参数
+            await device.connect()
             
             # 缓存连接
             self._devices[container_id] = device
@@ -329,7 +474,13 @@ class AdbManager:
                     device.shell(command),
                     timeout=ADB_SHELL_TIMEOUT
                 )
-                return result.decode("utf-8", errors="replace") if result else ""
+                # 处理 bytes 和 str 两种返回类型（不同 ADB 库版本可能不同）
+                if isinstance(result, bytes):
+                    return result.decode("utf-8", errors="replace")
+                elif isinstance(result, str):
+                    return result
+                else:
+                    return str(result) if result else ""
                 
             except asyncio.TimeoutError:
                 raise HTTPException(

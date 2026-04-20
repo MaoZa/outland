@@ -265,6 +265,7 @@ class WebRTCManager:
                     - swipe: 滑动屏幕 {"action": "swipe", "x1": int, "y1": int, "x2": int, "y2": int, "duration": int}
                     - input: 文本输入 {"action": "input", "text": str}
                     - keyevent: 按键事件 {"action": "keyevent", "keycode": int}
+                    - config: 获取分辨率配置 {"action": "config"}
                     """
                     if message is None:
                         return
@@ -277,17 +278,25 @@ class WebRTCManager:
                         # 不能直接 await，否则会阻塞事件循环
                         if action == "click":
                             asyncio.create_task(
-                                adb_manager.tap(container_id, data["x"], data["y"])
+                                adb_manager.tap_with_conversion(
+                                    container_id,
+                                    data["x"],
+                                    data["y"],
+                                    data.get("video_width", 720),
+                                    data.get("video_height", 1280)
+                                )
                             )
                         elif action == "swipe":
                             asyncio.create_task(
-                                adb_manager.swipe(
+                                adb_manager.swipe_with_conversion(
                                     container_id,
                                     data["x1"],
                                     data["y1"],
                                     data["x2"],
                                     data["y2"],
-                                    data.get("duration", 300)
+                                    data.get("duration", 300),
+                                    data.get("video_width", 720),
+                                    data.get("video_height", 1280)
                                 )
                             )
                         elif action == "input":
@@ -298,12 +307,25 @@ class WebRTCManager:
                             asyncio.create_task(
                                 adb_manager.keyevent(container_id, data["keycode"])
                             )
+                        elif action == "config":
+                            # 前端请求分辨率配置
+                            # 从 track 获取实际分辨率
+                            if container_id in self._tracks:
+                                track = self._tracks[container_id]
+                                width, height = track.get_video_resolution()
+                                # 回复配置信息
+                                if channel.readyState == "open":
+                                    channel.send(json.dumps({
+                                        "type": "config",
+                                        "width": width,
+                                        "height": height
+                                    }))
                     except json.JSONDecodeError:
                         pass  # 忽略无效的 JSON
                     except KeyError as e:
                         # 缺少必要的参数
                         pass
-    
+
     def _setup_connection_close(self, pc: RTCPeerConnection, container_id: str) -> None:
         """
         设置连接关闭处理

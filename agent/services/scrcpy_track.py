@@ -97,6 +97,10 @@ class ScrcpyTrack(MediaStreamTrack):
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
 
+        # 视频分辨率（从 Scrcpy 握手头获取）
+        self._video_width: int = SCRCPY_MAX_SIZE
+        self._video_height: int = int(SCRCPY_MAX_SIZE * 16 / 9)  # 默认 16:9
+
         # 阶段 4：PyAV 底层 H.264 解码器
         self._codec: Optional[av.CodecContext] = None
 
@@ -347,10 +351,27 @@ class ScrcpyTrack(MediaStreamTrack):
         width       = struct.unpack(">I", handshake[69:73])[0]   # uint32 BE
         height      = struct.unpack(">I", handshake[73:77])[0]   # uint32 BE
 
+        # 保存视频分辨率供触摸坐标转换使用
+        self._video_width = width
+        self._video_height = height
+
         logger.info(
             f"[ScrcpyTrack] [Phase 3] 握手完成: "
             f"dummy=0x{dummy:02X}, device='{device_name}', codec='{codec_id}', 分辨率={width}x{height}"
         )
+
+    # ========================================================================
+    # 获取视频分辨率（供前端坐标转换使用）
+    # ========================================================================
+
+    def get_video_resolution(self) -> tuple[int, int]:
+        """
+        获取 Scrcpy 实际视频分辨率。
+
+        Returns:
+            tuple[int, int]: (宽度, 高度)
+        """
+        return (self._video_width, self._video_height)
 
     # ========================================================================
     # 阶段 4：初始化 PyAV 底层 H.264 解码器
