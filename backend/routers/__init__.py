@@ -7,6 +7,7 @@ from .actions import router as actions_router
 from .apk import router as apk_router
 from .auth import router as auth_router
 from .users import router as users_router
+from .external_devices import router as external_devices_router
 
 __all__ = [
     "health_router",
@@ -18,4 +19,5 @@ __all__ = [
     "apk_router",
     "auth_router",
     "users_router",
+    "external_devices_router",
 ]

@@ -367,7 +367,10 @@ class WebRTCManager:
         self,
         container_id: str,
         sdp: str,
-        offer_type: str = "offer"
+        offer_type: str = "offer",
+        external_adb_address: Optional[str] = None,
+        rsa_key_path: Optional[str] = None,
+        rsa_key_content: Optional[str] = None,
     ) -> RTCSessionDescription:
         """
         Handle WebRTC Offer and return Answer
@@ -399,6 +402,16 @@ class WebRTCManager:
             adb_manager = self._get_adb_manager()
             logger.debug("[WebRTC] Got AdbManager")
             
+            if external_adb_address:
+                resolved_key_path = rsa_key_path
+                if rsa_key_content and not (rsa_key_path and os.path.exists(rsa_key_path)):
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False, dir='/tmp') as kf:
+                        kf.write(rsa_key_content)
+                        resolved_key_path = kf.name
+                    os.chmod(resolved_key_path, 0o600)
+                adb_manager.register_external_device(container_id, external_adb_address, resolved_key_path)
+            
             adb_port = adb_manager._get_container_adb_port(container_id)
             logger.debug("[WebRTC] Got ADB port: %d", adb_port)
             
@@ -424,8 +437,7 @@ class WebRTCManager:
             # Create video track (if not already created for this container)
             if container_id not in self._tracks:
                 logger.info("[WebRTC] Creating ScrcpyTrack for container %s (ADB port: %d)...", container_id, adb_port)
-                # Create ScrcpyTrack instance and start scrcpy asynchronously
-                track = ScrcpyTrack(container_id, adb_port)
+                track = ScrcpyTrack(container_id, adb_port, external_adb_address=external_adb_address)
                 await track._start_scrcpy_async()
                 self._tracks[container_id] = track
                 

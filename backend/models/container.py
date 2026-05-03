@@ -18,6 +18,8 @@ class ContainerInfo(BaseModel):
     created_at: str
     source: Optional[str] = None
     agent_id: Optional[str] = None
+    adb_address: Optional[str] = None
+    has_rsa_key: bool = False
 
 
 class InstanceListResponse(BaseModel):

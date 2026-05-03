@@ -52,3 +52,19 @@ class AgentState(Base):
     agent_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     url: Mapped[str] = mapped_column(String(255))
     last_heartbeat: Mapped[float] = mapped_column(nullable=False)
+
+
+class ExternalDevice(Base):
+    __tablename__ = "external_devices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uuid: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    agent_id: Mapped[str] = mapped_column(String(255), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    adb_host: Mapped[str] = mapped_column(String(255), nullable=False)
+    adb_port: Mapped[int] = mapped_column(Integer, default=5555)
+    rsa_key_path: Mapped[str] = mapped_column(String(512), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="active")
+    resolution: Mapped[str] = mapped_column(String(20), default="720x1280")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -8,7 +8,7 @@ RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.li
     sed -i 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true && \
     sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
-# 安装系统依赖
+# 安装系统依赖（编解码器支持）
 RUN apt-get update && apt-get install -y \
     wget \
     unzip \
@@ -18,6 +18,19 @@ RUN apt-get update && apt-get install -y \
     libsdl2-2.0-0 \
     libsdl2-image-2.0-0 \
     libusb-1.0-0 \
+    libx264-dev \
+    libvpx-dev \
+    nasm \
+    pkg-config \
+    libssl-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswscale-dev \
+    libswresample-dev \
+    libavfilter-dev \
+    build-essential \
+    libavdevice-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 scrcpy v3.3.4
@@ -58,7 +71,9 @@ WORKDIR /app
 
 # 复制依赖文件并安装
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt numpy
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip uninstall -y av aiortc
+RUN pip install --no-cache-dir av==12.3.0 aiortc
 
 # 复制应用代码
 COPY . .

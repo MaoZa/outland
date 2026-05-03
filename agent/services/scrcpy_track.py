@@ -61,8 +61,12 @@ SCRCPY_SERVER_PATH: str = os.environ.get(
 )
 SCRCPY_SERVER_VERSION: str = "3.3.4"
 
-# ADB TCP forwarding port (host local port → device abstract socket)
-SCRCPY_FORWARD_PORT: int = 27183
+# ADB TCP forwarding port base (host local port → device abstract socket)
+# Each ScrcpyTrack instance gets a unique port starting from this base
+SCRCPY_FORWARD_PORT_BASE: int = 27183
+
+_forward_port_counter = 0
+_used_forward_ports: set = set()
 
 # Scrcpy video parameters (optimized for low latency)
 # Note: Scrcpy defaults to video wallpaper resolution, limited by max_size
@@ -135,7 +139,7 @@ class ScrcpyTrack(MediaStreamTrack):
 
     kind = "video"
 
-    def __init__(self, container_id: str, adb_port: int, quality: VideoQualityLevel = None) -> None:
+    def __init__(self, container_id: str, adb_port: int, quality: VideoQualityLevel = None, external_adb_address: Optional[str] = None) -> None:
         """
         Initialize ScrcpyTrack.
 
@@ -143,30 +147,30 @@ class ScrcpyTrack(MediaStreamTrack):
             container_id: Docker container ID or name
             adb_port: ADB port mapped on host
             quality: Video quality level (default: HIGH)
+            external_adb_address: External ADB address (host:port) for non-Docker devices
         """
         super().__init__()
 
         self.container_id = container_id
         self.adb_port = adb_port
+        self._external_adb_address = external_adb_address
 
-        # Video quality settings
         if quality is None:
             quality = VideoQualityLevel.HIGH
         self._quality = quality
         self._max_size = quality.max_size
         self._bitrate = quality.bitrate
 
-        # Get actual container name (for ADB connection)
-        self._container_name: str = self._get_container_name(container_id)
+        self._container_name: str = self._get_container_name(container_id) if not external_adb_address else container_id
 
-        # Determine whether to use host network mode (by checking if port is standard mapping of 5555)
-        # In host network mode, connect to Redroid using localhost:port
-        # In bridge network mode, connect to Redroid using container_name:5555
-        # Since DockerManager defaults to host network mode, default to localhost
         self._use_localhost_adb: bool = True
+        self._forward_port: int = self._allocate_forward_port()
+        self._video_codec: str = "h264"  # resolved from scrcpy handshake
 
-        # ADB device identifier: host mode uses localhost, normal mode uses container name
-        if self._use_localhost_adb:
+        if external_adb_address:
+            self._target_device = external_adb_address
+            self._use_localhost_adb = False
+        elif self._use_localhost_adb:
             self._target_device = f"127.0.0.1:{self.adb_port}"
         else:
             self._target_device = f"{self._container_name}:{self.adb_port}"
@@ -196,6 +200,22 @@ class ScrcpyTrack(MediaStreamTrack):
         self._frame_count: int = 0
         self._last_fps_time: float = 0.0
         self._last_fps_count: int = 0
+
+    @staticmethod
+    def _allocate_forward_port() -> int:
+        global _forward_port_counter
+        while True:
+            port = SCRCPY_FORWARD_PORT_BASE + _forward_port_counter
+            _forward_port_counter += 1
+            if port not in _used_forward_ports:
+                _used_forward_ports.add(port)
+                logger.info("[ScrcpyTrack] Allocated forward port: %d", port)
+                return port
+
+    @staticmethod
+    def _release_forward_port(port: int) -> None:
+        _used_forward_ports.discard(port)
+        logger.info("[ScrcpyTrack] Released forward port: %d", port)
 
     def _get_container_name(self, container_id: str) -> str:
         """
@@ -367,16 +387,16 @@ class ScrcpyTrack(MediaStreamTrack):
         # First cleanup possible old forward, prevent "already forwarded" error
         await asyncio.create_subprocess_exec(
             "adb", "-s", self._target_device,
-            "forward", "--remove", f"tcp:{SCRCPY_FORWARD_PORT}",
+            "forward", "--remove", f"tcp:{self._forward_port}",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
 
-        logger.info(f"[ScrcpyTrack] [Phase 1] Establishing tunnel: tcp:{SCRCPY_FORWARD_PORT} → localabstract:scrcpy")
+        logger.info(f"[ScrcpyTrack] [Phase 1] Establishing tunnel: tcp:{self._forward_port} → localabstract:scrcpy")
         fwd_proc = await asyncio.create_subprocess_exec(
             "adb", "-s", self._target_device,
             "forward",
-            f"tcp:{SCRCPY_FORWARD_PORT}",
+            f"tcp:{self._forward_port}",
             "localabstract:scrcpy",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -427,7 +447,9 @@ class ScrcpyTrack(MediaStreamTrack):
         )
 
         # Give server time to initialize and listen on Socket
-        await asyncio.sleep(1.0)
+        # External network devices need more time to start scrcpy-server
+        wait_time = 2.5 if self._external_adb_address else 1.0
+        await asyncio.sleep(wait_time)
 
         # Check if process exited unexpectedly
         if self._server_process.returncode is not None:
@@ -472,11 +494,11 @@ class ScrcpyTrack(MediaStreamTrack):
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(
-                    f"[ScrcpyTrack] [Phase 3] Attempting to connect 127.0.0.1:{SCRCPY_FORWARD_PORT} "
+                    f"[ScrcpyTrack] [Phase 3] Attempting to connect 127.0.0.1:{self._forward_port} "
                     f"({attempt}/{max_retries})..."
                 )
                 self._reader, self._writer = await asyncio.open_connection(
-                    "127.0.0.1", SCRCPY_FORWARD_PORT
+                    "127.0.0.1", self._forward_port
                 )
                 logger.info("[ScrcpyTrack] [Phase 3] Socket connection successful!")
                 break
@@ -484,7 +506,7 @@ class ScrcpyTrack(MediaStreamTrack):
                 if attempt >= max_retries:
                     raise RuntimeError(
                         f"Cannot connect to Scrcpy server "
-                        f"(127.0.0.1:{SCRCPY_FORWARD_PORT}), retried {max_retries} times: {e}"
+                        f"(127.0.0.1:{self._forward_port}), retried {max_retries} times: {e}"
                     )
                 logger.debug(f"[ScrcpyTrack] [Phase 3] Connection failed, retry in {retry_delay}s: {e}")
                 await asyncio.sleep(retry_delay)
@@ -492,7 +514,27 @@ class ScrcpyTrack(MediaStreamTrack):
         # Read 77-byte handshake header
         # Format: 1 dummy + 64 device_name + 4 codec_id + 4 width (uint32 BE) + 4 height (uint32 BE)
         logger.info("[ScrcpyTrack] [Phase 3] Reading handshake header (77 bytes)...")
-        handshake = await self._reader.readexactly(77)
+        try:
+            handshake = await self._reader.readexactly(77)
+        except asyncio.IncompleteReadError as e:
+            server_stderr = ""
+            if self._server_process:
+                if self._server_process.returncode is not None:
+                    try:
+                        _, stderr = await asyncio.wait_for(self._server_process.communicate(), timeout=3.0)
+                        server_stderr = stderr.decode(errors="replace").strip()
+                    except Exception:
+                        server_stderr = "(could not read stderr)"
+                    logger.error(
+                        "[ScrcpyTrack] [Phase 3] Server exited (code %d) during handshake. stderr: %s",
+                        self._server_process.returncode, server_stderr,
+                    )
+                else:
+                    logger.error("[ScrcpyTrack] [Phase 3] Server still running but closed socket (read %d of %d bytes)", len(e.partial), e.expected)
+            raise RuntimeError(
+                f"Scrcpy server closed socket during handshake (read {len(e.partial)} of {e.expected} bytes)."
+                f"{' Server exited: ' + server_stderr if server_stderr else ''}"
+            )
 
         dummy       = handshake[0]
         device_name = handshake[1:65].rstrip(b"\x00").decode("utf-8", errors="replace")
@@ -500,7 +542,8 @@ class ScrcpyTrack(MediaStreamTrack):
         width       = struct.unpack(">I", handshake[69:73])[0]   # uint32 BE
         height      = struct.unpack(">I", handshake[73:77])[0]   # uint32 BE
 
-        # Save video resolution for touch coordinate conversion
+        # Save video codec and resolution
+        self._video_codec = codec_id
         self._video_width = width
         self._video_height = height
 
@@ -528,12 +571,13 @@ class ScrcpyTrack(MediaStreamTrack):
 
     def _phase4_init_decoder(self) -> None:
         """
-        Initialize H.264 decoder using PyAV low-level API.
+        Initialize decoder using the codec reported by scrcpy during handshake.
 
-        Absolutely avoid using av.open(pipe), to prevent blocking + deadlock issues.
+        Scrcpy v3.x supports: h264, vp8, vp9, av1 (device codec capability dependent).
         """
-        logger.info("[ScrcpyTrack] [Phase 4] Initializing PyAV low-level H.264 decoder...")
-        self._codec = av.CodecContext.create("h264", "r")
+        codec_name = self._video_codec
+        logger.info("[ScrcpyTrack] [Phase 4] Initializing %s decoder...", codec_name)
+        self._codec = av.CodecContext.create(codec_name, "r")
         logger.info(f"[ScrcpyTrack] [Phase 4] Decoder ready: {self._codec.name}")
 
     # ========================================================================
@@ -603,25 +647,24 @@ class ScrcpyTrack(MediaStreamTrack):
         Returns:
             VideoFrame: yuv420p format, with correct pts and time_base set
         """
-        # Ensure yuv420p format
-        pix_fmt = frame.format.name if hasattr(frame.format, "name") else str(frame.pix_fmt)
-        if pix_fmt in ("yuv420p", "yuvj420p"):
-            ndarray = frame.to_ndarray(format="yuv420p")
-        else:
-            ndarray = frame.to_ndarray(format="yuv420p")
+        w = frame.width
+        h = frame.height
+        aligned_w = (w + 15) & ~15
+        aligned_h = (h + 15) & ~15
+        needs_reformat = (
+            aligned_w != w or aligned_h != h
+            or frame.format.name not in ("yuv420p", "yuvj420p")
+        )
+        if needs_reformat:
+            frame = frame.reformat(width=aligned_w, height=aligned_h, format="yuv420p")
 
-        video_frame = VideoFrame.from_ndarray(ndarray, format="yuv420p")
-
-        # PTS conversion: Scrcpy provides PTS in microseconds, time_base = 1/1_000_000
-        # aiortc prefers time_base = 1/90000, convert
         if pts_us > 0:
-            video_frame.pts = pts_us * 90 // 1000  # microseconds → 90kHz ticks (approximate)
+            frame.pts = pts_us * 90 // 1000
         else:
-            video_frame.pts = self._frame_count
+            frame.pts = self._frame_count
+        frame.time_base = Fraction(1, 90000)
 
-        video_frame.time_base = Fraction(1, 90000)
-
-        return video_frame
+        return frame
 
     def _update_fps_stats(self) -> None:
         """
@@ -681,19 +724,22 @@ class ScrcpyTrack(MediaStreamTrack):
 
         # 3. Remove ADB TCP tunnel (prevent port deadlock)
         try:
-            logger.info(f"[ScrcpyTrack] Cleaning up ADB forward tcp:{SCRCPY_FORWARD_PORT}...")
+            logger.info(f"[ScrcpyTrack] Cleaning up ADB forward tcp:{self._forward_port}...")
             rm_proc = await asyncio.create_subprocess_exec(
                 "adb", "-s", self._target_device,
-                "forward", "--remove", f"tcp:{SCRCPY_FORWARD_PORT}",
+                "forward", "--remove", f"tcp:{self._forward_port}",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(rm_proc.wait(), timeout=5.0)
-            logger.info(f"[ScrcpyTrack] ADB forward tcp:{SCRCPY_FORWARD_PORT} removed")
+            logger.info(f"[ScrcpyTrack] ADB forward tcp:{self._forward_port} removed")
         except Exception as e:
             logger.debug(f"[ScrcpyTrack] Error removing ADB forward (ignored): {e}")
 
-        # 4. Cleanup decoder and frame queue
+        # 4. Release forward port
+        self._release_forward_port(self._forward_port)
+
+        # 5. Cleanup decoder and frame queue
         self._codec = None
         self._frame_queue.clear()
 
@@ -732,7 +778,7 @@ class ScrcpyTrack(MediaStreamTrack):
             logger.info(f"[ScrcpyTrack] ========== Restarting with quality: {quality.name} ==========")
             await self._phase1_push_and_tunnel()
             await self._phase2_start_server()
-            self._phase3_socket_handshake()
+            await self._phase3_socket_handshake()
             self._phase4_init_decoder()
             self._started = True
             logger.info(f"[ScrcpyTrack] ========== Restart complete, streaming at {quality.name} ==========")

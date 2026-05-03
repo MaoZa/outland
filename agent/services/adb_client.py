@@ -119,6 +119,10 @@ class AdbManager:
         self._initialized = True
         # Cache actual screen resolution for each container
         self._screen_sizes: Dict[str, tuple[int, int]] = {}
+        # External ADB address mapping: container_id -> "host:port"
+        self._external_addresses: Dict[str, str] = {}
+        # RSA key path mapping: container_id -> key file path
+        self._rsa_key_paths: Dict[str, str] = {}
     
     # =========================================================================
     # Public API: Low-level action wrappers
@@ -200,6 +204,17 @@ class AdbManager:
     # =========================================================================
     # Screen resolution and coordinate conversion
     # =========================================================================
+    
+    def register_external_device(self, container_id: str, adb_address: str, rsa_key_path: Optional[str] = None) -> None:
+        self._external_addresses[container_id] = adb_address
+        if rsa_key_path:
+            self._rsa_key_paths[container_id] = rsa_key_path
+    
+    def is_external_device(self, container_id: str) -> bool:
+        return container_id in self._external_addresses or container_id.startswith("ext_")
+    
+    def get_external_address(self, container_id: str) -> Optional[str]:
+        return self._external_addresses.get(container_id)
     
     def set_screen_size(self, container_id: str, width: int, height: int) -> None:
         """
@@ -501,20 +516,20 @@ class AdbManager:
             HTTPException: Container not found or connection failed
         """
         try:
-            # Get host port mapped on host machine
+            ext_addr = self._external_addresses.get(container_id)
+            if ext_addr:
+                host, _, port_str = ext_addr.partition(":")
+                port = int(port_str) if port_str else 5555
+                logger.info("[AdbManager] Connecting to external device %s at %s:%d", container_id, host, port)
+                device = AdbDeviceTcpAsync(host, port)
+                await device.connect()
+                self._devices[container_id] = device
+                return
+
             host_port = self._get_container_adb_port(container_id)
-            
-            # Ensure resolvable host address
             target_host = self._resolve_host(REDROID_HOST)
-            
-            # Direct connection to localhost (Agent and Redroid deployed on same machine)
             device = AdbDeviceTcpAsync(target_host, host_port)
-            
-            # Connect device (skip RSA auth)
-            # New version of adb-shell's connect() doesn't accept parameters
             await device.connect()
-            
-            # Cache connection
             self._devices[container_id] = device
             
         except docker.errors.NotFound:
@@ -534,19 +549,11 @@ class AdbManager:
             )
     
     def _get_container_adb_port(self, container_id: str) -> int:
-        """
-        Get the actual port on host machine mapped from container's internal 5555/tcp port
-        
-        Since Agent uses host network mode, returns 5555 directly.
-        Only queries Docker API when port mapping is needed.
-        
-        Args:
-            container_id: Docker container ID or name, or direct ADB connection identifiers like "localhost"/"default"
-        
-        Returns:
-            int: Port mapped on host machine (5555 in host mode)
-        """
-        # If direct ADB connection identifier, don't query Docker API, return default port
+        ext_addr = self._external_addresses.get(container_id)
+        if ext_addr:
+            _, _, port_str = ext_addr.partition(":")
+            return int(port_str) if port_str else 5555
+
         if container_id in ("localhost", "default", "redroid"):
             logger.info("[AdbManager] Using direct ADB connection identifier '%s', returning port %d", container_id, REDROID_ADB_PORT)
             return REDROID_ADB_PORT
@@ -595,28 +602,21 @@ class AdbManager:
         """
         Execute ADB shell command on specified container
         
-        Includes zombie connection self-healing: first failure automatically removes dead connection and retries.
-        
-        Args:
-            container_id: Docker container ID or name
-            command: Shell command to execute
-            
-        Returns:
-            str: Command execution result
-            
-        Raises:
-            HTTPException: Container not found or command execution failed
+        For external devices (MIUI etc.) that require TLS, use adb CLI instead
+        of adb_shell library which doesn't support ADB TLS authentication.
         """
+        ext_addr = self._external_addresses.get(container_id)
+        if ext_addr:
+            return await self._execute_via_cli(ext_addr, command)
+
         device = await self._get_or_connect(container_id)
         
         for attempt in range(2):
             try:
-                # Execute shell command
                 result = await asyncio.wait_for(
                     device.shell(command),
                     timeout=ADB_SHELL_TIMEOUT
                 )
-                # Handle both bytes and str return types (different ADB library versions)
                 if isinstance(result, bytes):
                     return result.decode("utf-8", errors="replace")
                 elif isinstance(result, str):
@@ -630,20 +630,15 @@ class AdbManager:
                     detail=f"ADB Shell execution timeout: {command}"
                 )
             except (socket.error, ConnectionResetError, ConnectionRefusedError) as e:
-                # Catch connection exceptions, self-heal
                 self._devices.pop(container_id, None)
-                
                 if attempt == 0:
-                    # First failure: remove dead connection and try to rebuild
                     continue
                 else:
-                    # Second attempt also failed
                     raise HTTPException(
                         status_code=500,
                         detail=f"ADB connection dropped and cannot be rebuilt: {str(e)}"
                     )
             except Exception as e:
-                # Other exceptions report directly
                 raise HTTPException(
                     status_code=500,
                     detail=f"ADB Shell execution failed: {str(e)}"
@@ -653,6 +648,36 @@ class AdbManager:
             status_code=500,
             detail="ADB execution exception: unknown error"
         )
+    
+    async def _execute_via_cli(self, device_address: str, command: str) -> str:
+        """
+        Execute ADB shell command via adb CLI for external devices.
+        
+        External devices (MIUI wireless debugging) require TLS authentication
+        which the adb_shell library doesn't support. The adb CLI handles TLS
+        natively since it's already connected via 'adb connect'.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "adb", "-s", device_address, "shell", command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=ADB_SHELL_TIMEOUT
+            )
+            if proc.returncode != 0:
+                err = stderr_bytes.decode("utf-8", errors="replace").strip()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"ADB shell failed (code {proc.returncode}): {err}"
+                )
+            return stdout_bytes.decode("utf-8", errors="replace")
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=f"ADB Shell execution timeout (via CLI): {command}"
+            )
     
     # =========================================================================
     # Utility Methods

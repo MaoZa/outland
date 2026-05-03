@@ -30,6 +30,12 @@ from .action import (
     ActionResponse,
 )
 from .apk import ApkInstallResponse
+from .external_device import (
+    ExternalDeviceCreate,
+    ExternalDeviceUpdate,
+    ExternalDeviceResponse,
+    ExternalDeviceTestResponse,
+)
 
 __all__ = [
     "AgentRegisterRequest",
@@ -56,4 +62,8 @@ __all__ = [
     "KeyEventRequest",
     "ActionResponse",
     "ApkInstallResponse",
+    "ExternalDeviceCreate",
+    "ExternalDeviceUpdate",
+    "ExternalDeviceResponse",
+    "ExternalDeviceTestResponse",
 ]

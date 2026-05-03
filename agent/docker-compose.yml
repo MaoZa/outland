@@ -25,4 +25,9 @@ services:
     volumes:
       # Mount Docker Socket to manage containers
       - /var/run/docker.sock:/var/run/docker.sock
+      # Persist ADB key pair so paired devices remain trusted after restart
+      - ./agent-adb-keys:/root/.android
     restart: unless-stopped
+
+volumes:
+  agent-adb-keys:

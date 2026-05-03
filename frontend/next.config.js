@@ -108,6 +108,12 @@ const nextConfig = {
         destination: 'http://backend:8000/api/agents/:path*',
       },
 
+      // External Device API
+      {
+        source: '/api/external-devices/:path*',
+        destination: 'http://backend:8000/api/external-devices/:path*',
+      },
+
       // APK 安装 API (通过 Backend 转发到 Agent)
       {
         source: '/api/apk/install',

@@ -116,3 +116,5 @@ backend/*.pyc
 backend/*.pyo
 /frontend/node_modules/
 /frontend/.next/
+/backend-data/
+backend-data/

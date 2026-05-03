@@ -7,7 +7,7 @@ from typing import List, Set, Dict
 
 from auth.dependencies import get_current_user
 from database import get_db
-from database.models import User, Container
+from database.models import User, Container, ExternalDevice
 from models import PortMapping, ContainerInfo, InstanceListResponse, ErrorResponse
 from services import AGENT_REGISTRY, fetch_agent_instances
 
@@ -27,7 +27,15 @@ async def list_instances(
     )
     user_containers = result.scalars().all()
 
-    if not user_containers:
+    ext_result = await db.execute(
+        select(ExternalDevice).where(
+            ExternalDevice.user_id == current_user.id,
+            ExternalDevice.status == "active",
+        )
+    )
+    external_devices = ext_result.scalars().all()
+
+    if not user_containers and not external_devices:
         return InstanceListResponse(total=0, instances=[])
 
     agent_live_data: Dict[str, dict] = {}
@@ -69,7 +77,7 @@ async def list_instances(
                 "image": live.get("image", "unknown"),
                 "ports": live.get("ports", []),
                 "created_at": live.get("created_at", str(c.created_at)),
-                "source": live.get("source", "db"),
+                "source": "docker",
                 "agent_id": c.agent_id,
             })
         else:
@@ -81,9 +89,24 @@ async def list_instances(
                 "image": "unknown",
                 "ports": [],
                 "created_at": str(c.created_at),
-                "source": "db",
+                "source": "docker",
                 "agent_id": c.agent_id,
             })
+
+    for d in external_devices:
+        all_instances.append({
+            "name": d.name,
+            "id": d.uuid,
+            "status": "running",
+            "state": "external",
+            "image": "external-device",
+            "ports": [{"container_port": d.adb_port, "host_port": d.adb_port, "protocol": "tcp"}],
+            "created_at": str(d.created_at),
+            "source": "external",
+            "agent_id": d.agent_id,
+            "adb_address": f"{d.adb_host}:{d.adb_port}",
+            "has_rsa_key": bool(d.rsa_key_path),
+        })
 
     return InstanceListResponse(
         total=len(all_instances),

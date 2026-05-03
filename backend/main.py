@@ -21,6 +21,7 @@ from routers import (
     apk_router,
     auth_router,
     users_router,
+    external_devices_router,
 )
 from middleware import RequestLoggingMiddleware, ExceptionHandlerMiddleware
 
@@ -94,6 +95,7 @@ app.include_router(containers_router)
 app.include_router(stream_router)
 app.include_router(actions_router)
 app.include_router(apk_router)
+app.include_router(external_devices_router)
 
 
 if __name__ == "__main__":

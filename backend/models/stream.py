@@ -7,6 +7,9 @@ class WebRTCOfferRequest(BaseModel):
     agent_id: Optional[str] = None
     sdp: str
     type: str = "offer"
+    external_adb_address: Optional[str] = None
+    rsa_key_path: Optional[str] = None
+    rsa_key_content: Optional[str] = None
 
 
 class WebRTCAnswerResponse(BaseModel):
@@ -18,6 +21,9 @@ class QualityChangeRequest(BaseModel):
     container_id: str
     agent_id: Optional[str] = None
     quality: str = Field(description="Quality level: high, medium, or low")
+    external_adb_address: Optional[str] = None
+    rsa_key_path: Optional[str] = None
+    rsa_key_content: Optional[str] = None
 
 
 class QualityChangeResponse(BaseModel):

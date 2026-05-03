@@ -41,6 +41,8 @@ logging.getLogger("aiortc").setLevel(logging.INFO)
 logging.getLogger("av").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("docker.utils").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Create logger instance
 logger = logging.getLogger(__name__)
@@ -136,6 +138,9 @@ class WebRTCOfferRequest(BaseModel):
     container_id: str
     sdp: str
     type: str = "offer"
+    external_adb_address: Optional[str] = None
+    rsa_key_path: Optional[str] = None
+    rsa_key_content: Optional[str] = None
 
 
 class WebRTCAnswerResponse(BaseModel):
@@ -153,6 +158,7 @@ class ClickRequest(BaseModel):
     container_id: Annotated[str, Field(description="Docker container ID or name", min_length=1)]
     x: Annotated[int, Field(description="X coordinate of tap", ge=0)]
     y: Annotated[int, Field(description="Y coordinate of tap", ge=0)]
+    external_adb_address: Optional[str] = None
 
 
 class SwipeRequest(BaseModel):
@@ -163,18 +169,21 @@ class SwipeRequest(BaseModel):
     x2: Annotated[int, Field(description="End X coordinate", ge=0)]
     y2: Annotated[int, Field(description="End Y coordinate", ge=0)]
     duration: Annotated[int, Field(description="Swipe duration (milliseconds)", ge=0, default=300)]
+    external_adb_address: Optional[str] = None
 
 
 class TextRequest(BaseModel):
     """Text input request model"""
     container_id: Annotated[str, Field(description="Docker container ID or name", min_length=1)]
     text: Annotated[str, Field(description="Text content to input")]
+    external_adb_address: Optional[str] = None
 
 
 class KeyEventRequest(BaseModel):
     """Key event request model"""
     container_id: Annotated[str, Field(description="Docker container ID or name", min_length=1)]
     keycode: Annotated[int, Field(description="Android keycode (e.g., 26=POWER, 4=BACK, 3=HOME)")]
+    external_adb_address: Optional[str] = None
 
 
 class ActionResponse(BaseModel):
@@ -271,9 +280,7 @@ async def _heartbeat_loop():
             if e.response.status_code == 404:
                 registered = False
         except Exception as e:
-            print(f"[Outland Agent] Heartbeat error: {e}")
-            # Reset registration state on connection failure, re-register next cycle
-            registered = False
+            logger.warning("[Outland Agent] Heartbeat error: %s", e)
         
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
@@ -695,7 +702,10 @@ async def handle_webrtc_offer(request: WebRTCOfferRequest) -> WebRTCAnswerRespon
         answer = await webrtc_manager.handle_offer(
             container_id=request.container_id,
             sdp=request.sdp,
-            offer_type=request.type
+            offer_type=request.type,
+            external_adb_address=request.external_adb_address,
+            rsa_key_path=request.rsa_key_path,
+            rsa_key_content=request.rsa_key_content,
         )
         
         return WebRTCAnswerResponse(
@@ -715,6 +725,9 @@ async def handle_webrtc_offer(request: WebRTCOfferRequest) -> WebRTCAnswerRespon
 class QualityChangeRequest(BaseModel):
     container_id: str
     quality: str = Field(description="Quality level: high, medium, or low")
+    external_adb_address: Optional[str] = None
+    rsa_key_path: Optional[str] = None
+    rsa_key_content: Optional[str] = None
 
 
 class QualityChangeResponse(BaseModel):
@@ -818,6 +831,8 @@ async def click(request: ClickRequest) -> ActionResponse:
         from services.adb_client import get_adb_manager
         
         adb = get_adb_manager()
+        if request.external_adb_address:
+            adb.register_external_device(request.container_id, request.external_adb_address)
         await adb.tap(request.container_id, request.x, request.y)
         return ActionResponse(
             success=True,
@@ -841,6 +856,8 @@ async def swipe(request: SwipeRequest) -> ActionResponse:
         from services.adb_client import get_adb_manager
         
         adb = get_adb_manager()
+        if request.external_adb_address:
+            adb.register_external_device(request.container_id, request.external_adb_address)
         await adb.swipe(
             request.container_id,
             request.x1, request.y1,
@@ -869,6 +886,8 @@ async def text(request: TextRequest) -> ActionResponse:
         from services.adb_client import get_adb_manager
         
         adb = get_adb_manager()
+        if request.external_adb_address:
+            adb.register_external_device(request.container_id, request.external_adb_address)
         await adb.input_text(request.container_id, request.text)
         return ActionResponse(
             success=True,
@@ -892,6 +911,8 @@ async def keyevent(request: KeyEventRequest) -> ActionResponse:
         from services.adb_client import get_adb_manager
         
         adb = get_adb_manager()
+        if request.external_adb_address:
+            adb.register_external_device(request.container_id, request.external_adb_address)
         await adb.keyevent(request.container_id, request.keycode)
         
         # Common keycode name mapping
@@ -920,6 +941,159 @@ async def keyevent(request: KeyEventRequest) -> ActionResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Key event failed: {str(e)}"
         )
+
+
+# ============================================================================
+# API Routes: External Device Connection
+# ============================================================================
+
+class ExternalConnectRequest(BaseModel):
+    """External device connection test request"""
+    adb_address: str = Field(description="ADB address in host:port format")
+    rsa_key_path: Optional[str] = None
+    rsa_key_content: Optional[str] = None
+
+
+class ExternalConnectResponse(BaseModel):
+    """External device connection test response"""
+    success: bool
+    message: str = ""
+
+
+class ExternalPairRequest(BaseModel):
+    """ADB wireless pairing request"""
+    pair_address: str = Field(description="Pairing address in host:port format (from MIUI wireless debugging)")
+    pairing_code: str = Field(description="6-digit pairing code displayed on device")
+    rsa_key_path: Optional[str] = None
+    rsa_key_content: Optional[str] = None
+
+
+class ExternalPairResponse(BaseModel):
+    """ADB wireless pairing response"""
+    success: bool
+    message: str = ""
+
+
+@app.post(
+    "/api/external/pair",
+    response_model=ExternalPairResponse,
+    tags=["External Devices"]
+)
+async def pair_external_device(request: ExternalPairRequest) -> ExternalPairResponse:
+    """
+    Pair with an Android device via ADB wireless debugging.
+
+    This executes `adb pair <host>:<port>` with the pairing code.
+    Used for MIUI wireless debugging setup (pairing code or QR code method).
+    """
+    import tempfile
+    try:
+        env = os.environ.copy()
+        temp_key_file = None
+
+        if request.rsa_key_content:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
+                f.write(request.rsa_key_content)
+                temp_key_file = f.name
+            env["ADB_VENDOR_KEYS"] = temp_key_file
+            os.chmod(temp_key_file, 0o600)
+        elif request.rsa_key_path and os.path.exists(request.rsa_key_path):
+            env["ADB_VENDOR_KEYS"] = request.rsa_key_path
+
+        try:
+            logger.info("[External Pair] Pairing with %s ...", request.pair_address)
+            proc = await asyncio.create_subprocess_exec(
+                "adb", "pair", request.pair_address, request.pairing_code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=15.0,
+            )
+            stdout_str = stdout_bytes.decode(errors="replace").strip()
+            stderr_str = stderr_bytes.decode(errors="replace").strip()
+
+            logger.info("[External Pair] adb pair output: %s %s", stdout_str, stderr_str)
+
+            if proc.returncode == 0 and ("successfully" in stdout_str.lower() or "successfully" in stderr_str.lower()):
+                return ExternalPairResponse(success=True, message=f"Paired successfully: {stdout_str or stderr_str}")
+
+            if "failed" in stdout_str.lower() or "failed" in stderr_str.lower() or proc.returncode != 0:
+                return ExternalPairResponse(
+                    success=False,
+                    message=f"Pairing failed: {stdout_str or stderr_str or f'exit code {proc.returncode}'}",
+                )
+
+            return ExternalPairResponse(
+                success=False,
+                message=f"Unexpected response: {stdout_str or stderr_str or 'no output'}",
+            )
+        finally:
+            if temp_key_file and os.path.exists(temp_key_file):
+                os.remove(temp_key_file)
+    except asyncio.TimeoutError:
+        return ExternalPairResponse(success=False, message="Pairing timeout (15s) — ensure device is in pairing mode")
+    except Exception as e:
+        return ExternalPairResponse(success=False, message=f"Error: {str(e)}")
+
+
+@app.post(
+    "/api/external/connect",
+    response_model=ExternalConnectResponse,
+    tags=["External Devices"]
+)
+async def test_external_connection(request: ExternalConnectRequest) -> ExternalConnectResponse:
+    """Test ADB connection to an external device"""
+    import tempfile
+    try:
+        env = os.environ.copy()
+        temp_key_file = None
+
+        if request.rsa_key_content:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
+                f.write(request.rsa_key_content)
+                temp_key_file = f.name
+            env["ADB_VENDOR_KEYS"] = temp_key_file
+            os.chmod(temp_key_file, 0o600)
+        elif request.rsa_key_path and os.path.exists(request.rsa_key_path):
+            env["ADB_VENDOR_KEYS"] = request.rsa_key_path
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "adb", "connect", request.adb_address,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            stdout_str = stdout.decode(errors="replace").strip()
+            stderr_str = stderr.decode(errors="replace").strip()
+
+            if "connected" in stdout_str.lower() or "already connected" in stdout_str.lower():
+                devices_proc = await asyncio.create_subprocess_exec(
+                    "adb", "devices",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                dev_stdout, _ = await devices_proc.communicate()
+                dev_output = dev_stdout.decode(errors="replace")
+
+                if request.adb_address in dev_output and "device" in dev_output:
+                    return ExternalConnectResponse(success=True, message=f"Connected: {stdout_str}")
+
+            return ExternalConnectResponse(
+                success=False,
+                message=f"Connection failed: {stdout_str or stderr_str or 'unknown error'}",
+            )
+        finally:
+            if temp_key_file and os.path.exists(temp_key_file):
+                os.remove(temp_key_file)
+    except asyncio.TimeoutError:
+        return ExternalConnectResponse(success=False, message="Connection timeout (10s)")
+    except Exception as e:
+        return ExternalConnectResponse(success=False, message=f"Error: {str(e)}")
 
 
 # ============================================================================

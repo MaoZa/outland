@@ -6,13 +6,14 @@ from typing import Optional
 
 from auth.dependencies import get_current_user
 from database import get_db
-from database.models import User, Container
+from database.models import User, Container, ExternalDevice
 from models import (
     ClickRequest, SwipeRequest, TextRequest,
     KeyEventRequest, ActionResponse
 )
 from services import get_agent_url
 from core.http_client import get_http_client
+from .external_device_helpers import is_external_device, get_external_device, resolve_agent_for_device
 
 router = APIRouter(prefix="/api/action", tags=["Actions"])
 
@@ -39,6 +40,36 @@ async def _forward_action(
     agent_id: Optional[str],
     payload: dict
 ) -> ActionResponse:
+    if is_external_device(container_id):
+        device = await get_external_device(db, container_id, current_user)
+        agent_url, _ = await resolve_agent_for_device(device.agent_id)
+        adb_address = f"{device.adb_host}:{device.adb_port}"
+
+        try:
+            resp = await get_http_client().post(
+                f"{agent_url}/api/action/{action}",
+                json={**payload, "container_id": container_id, "external_adb_address": adb_address},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return ActionResponse(
+                success=data.get("success", True),
+                container_id=container_id,
+                action=action,
+                detail=data.get("detail", ""),
+            )
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=f"Action request failed: {e.response.text}",
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Cannot connect to Agent: {str(e)}",
+            )
+
     db_container = await verify_container_ownership(db, container_id, current_user)
     agent_id = agent_id or db_container.agent_id
 

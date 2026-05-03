@@ -25,8 +25,15 @@ import {
   Cpu,
   Maximize2,
   LogOut,
+  Wifi,
+  Key,
+  CheckCircle2,
+  XCircle,
+  Link2,
+  ChevronRight,
+  ChevronLeft,
 } from 'lucide-react'
-import { getInstances, spawnContainer, deleteContainer, getAgents, ContainerInfo, SpawnRequest, AgentInfo, resizeContainer } from '@/lib/api'
+import { getInstances, spawnContainer, deleteContainer, getAgents, ContainerInfo, SpawnRequest, AgentInfo, resizeContainer, addExternalDevice, deleteExternalDevice, testDirectConnection, pairExternalDevice } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
 
 // ============================================================================
@@ -94,83 +101,96 @@ function InstanceCard({
 }: {
   instance: InstanceWithPort
   onConnect: (id: string) => void
-  onDelete: (id: string) => void
+  onDelete: (id: string, source?: string) => void
   onResize: (id: string) => void
   isDeleting: boolean
 }) {
   const adbPort = instance.ports.find((p) => p.container_port === 5555)?.host_port
+  const isExternal = instance.source === 'external'
 
   return (
     <div className="bg-card border border-border rounded-xl p-5 hover:bg-card-hover transition-all duration-200 group">
-      {/* 头部：图标 + 名称 */}
       <div className="flex items-start gap-4">
-        <div className="p-3 bg-background-secondary rounded-lg group-hover:bg-accent/10 transition-colors">
-          <Smartphone className="w-8 h-8 text-gray-400 group-hover:text-accent transition-colors" />
+        <div className={`p-3 rounded-lg group-hover:bg-accent/10 transition-colors ${isExternal ? 'bg-blue-500/10' : 'bg-background-secondary'}`}>
+          {isExternal ? (
+            <Wifi className="w-8 h-8 text-blue-400 group-hover:text-accent transition-colors" />
+          ) : (
+            <Smartphone className="w-8 h-8 text-gray-400 group-hover:text-accent transition-colors" />
+          )}
         </div>
         <div className="flex-1 min-w-0">
-          <h3 className="text-lg font-medium text-gray-100 truncate">
-            {instance.name}
-          </h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-lg font-medium text-gray-100 truncate">
+              {instance.name}
+            </h3>
+            {isExternal && (
+              <span className="px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded-md border border-blue-500/30">
+                远程
+              </span>
+            )}
+          </div>
           <p className="text-xs text-gray-500 mt-1 font-mono">
             ID: {instance.id}
           </p>
         </div>
-        {/* 修改分辨率按钮 */}
+        {!isExternal && (
+          <button
+            onClick={() => onResize(instance.id)}
+            disabled={isDeleting || instance.status.toLowerCase() !== 'running'}
+            className="p-2 opacity-0 group-hover:opacity-100 hover:bg-blue-500/20 rounded-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="修改分辨率"
+          >
+            <Maximize2 className="w-4 h-4 text-blue-400" />
+          </button>
+        )}
         <button
-          onClick={() => onResize(instance.id)}
-          disabled={isDeleting || instance.status.toLowerCase() !== 'running'}
-          className="p-2 opacity-0 group-hover:opacity-100 hover:bg-blue-500/20 rounded-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
-          title="修改分辨率"
-        >
-          <Maximize2 className="w-4 h-4 text-blue-400" />
-        </button>
-        {/* 删除按钮 */}
-        <button
-          onClick={() => onDelete(instance.id)}
+          onClick={() => onDelete(instance.id, instance.source)}
           disabled={isDeleting}
           className="p-2 opacity-0 group-hover:opacity-100 hover:bg-red-500/20 rounded-lg transition-all duration-200 disabled:opacity-50"
-          title="删除容器"
+          title={isExternal ? '删除设备' : '删除容器'}
         >
           <Trash2 className="w-4 h-4 text-red-400" />
         </button>
       </div>
 
-      {/* 状态信息 */}
       <div className="mt-4 space-y-2">
-        <StatusBadge status={instance.status} />
+        <StatusBadge status={isExternal ? 'running' : instance.status} />
 
-        {/* ADB 端口 */}
-        {adbPort && (
+        {isExternal && instance.adb_address && (
+          <div className="flex items-center gap-2 text-sm text-gray-500">
+            <Server className="w-3.5 h-3.5" />
+            <span>ADB: {instance.adb_address}</span>
+          </div>
+        )}
+        {!isExternal && adbPort && (
           <div className="flex items-center gap-2 text-sm text-gray-500">
             <Server className="w-3.5 h-3.5" />
             <span>ADB: localhost:{adbPort}</span>
           </div>
         )}
 
-        {/* 镜像信息 */}
         <div className="flex items-center gap-2 text-sm text-gray-500">
           <Monitor className="w-3.5 h-3.5" />
-          <span className="truncate">{instance.image}</span>
+          <span className="truncate">{isExternal ? '外部 Android 设备' : instance.image}</span>
         </div>
       </div>
 
-      {/* 操作按钮 */}
       <div className="mt-5">
         <button
           onClick={() => onConnect(instance.id)}
-          disabled={instance.status.toLowerCase() !== 'running'}
+          disabled={instance.status.toLowerCase() !== 'running' && !isExternal}
           className={`
             w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-medium
             transition-all duration-200
             ${
-              instance.status.toLowerCase() === 'running'
+              instance.status.toLowerCase() === 'running' || isExternal
                 ? 'bg-accent hover:bg-accent-hover text-white shadow-lg shadow-accent/25'
                 : 'bg-gray-700 text-gray-500 cursor-not-allowed'
             }
           `}
         >
           <Play className="w-4 h-4" />
-          {instance.status.toLowerCase() === 'running' ? '连接' : '离线'}
+          {instance.status.toLowerCase() === 'running' || isExternal ? '连接' : '离线'}
         </button>
       </div>
     </div>
@@ -463,6 +483,411 @@ function CreateContainerModal({
 }
 
 // ============================================================================
+// Add External Device Modal (with MIUI wireless debugging pairing support)
+// ============================================================================
+
+function AddExternalDeviceModal({
+  isOpen,
+  onClose,
+  onAdd,
+  isAdding,
+  agents,
+}: {
+  isOpen: boolean
+  onClose: () => void
+  onAdd: (data: { name: string; adb_host: string; adb_port: number; agent_id?: string; rsa_key_file?: File }) => void
+  isAdding: boolean
+  agents: AgentInfo[]
+}) {
+  type Step = 'pair' | 'connect' | 'save'
+  const [step, setStep] = useState<Step>('pair')
+
+  const [name, setName] = useState('')
+  const [adbHost, setAdbHost] = useState('')
+  const [adbPort, setAdbPort] = useState(5555)
+  const [selectedAgent, setSelectedAgent] = useState('')
+  const [rsaKeyFile, setRsaKeyFile] = useState<File | null>(null)
+
+  const [pairHost, setPairHost] = useState('')
+  const [pairPort, setPairPort] = useState('')
+  const [pairingCode, setPairingCode] = useState('')
+
+  const [pairResult, setPairResult] = useState<{ success: boolean; message: string } | null>(null)
+  const [connectResult, setConnectResult] = useState<{ success: boolean; message: string } | null>(null)
+  const [isPairing, setIsPairing] = useState(false)
+  const [isConnecting, setIsConnecting] = useState(false)
+
+  const [connectMode, setConnectMode] = useState<'pair' | 'direct'>('pair')
+
+  useEffect(() => {
+    if (!isOpen) {
+      setStep('pair')
+      setName('')
+      setAdbHost('')
+      setAdbPort(5555)
+      setSelectedAgent('')
+      setRsaKeyFile(null)
+      setPairHost('')
+      setPairPort('')
+      setPairingCode('')
+      setPairResult(null)
+      setConnectResult(null)
+      setIsPairing(false)
+      setIsConnecting(false)
+      setConnectMode('pair')
+    }
+  }, [isOpen])
+
+  if (!isOpen) return null
+
+  const handlePair = async () => {
+    if (!pairHost || !pairPort || !pairingCode) return
+    setIsPairing(true)
+    setPairResult(null)
+    try {
+      const result = await pairExternalDevice({
+        pair_address: `${pairHost}:${pairPort}`,
+        pairing_code: pairingCode,
+        agent_id: selectedAgent || undefined,
+      })
+      setPairResult({ success: result.success, message: result.message })
+      if (result.success) {
+        if (!adbHost) setAdbHost(pairHost)
+      }
+    } catch (err) {
+      setPairResult({ success: false, message: err instanceof Error ? err.message : '配对失败' })
+    } finally {
+      setIsPairing(false)
+    }
+  }
+
+  const handleConnect = async () => {
+    if (!adbHost) return
+    setIsConnecting(true)
+    setConnectResult(null)
+    try {
+      const result = await testDirectConnection({
+        adb_host: adbHost,
+        adb_port: adbPort,
+        agent_id: selectedAgent || undefined,
+        rsa_key_file: rsaKeyFile || undefined,
+      })
+      setConnectResult({ success: result.success, message: result.message })
+    } catch (err) {
+      setConnectResult({ success: false, message: err instanceof Error ? err.message : '连接失败' })
+    } finally {
+      setIsConnecting(false)
+    }
+  }
+
+  const handleAdd = () => {
+    if (!name.trim() || !adbHost.trim()) {
+      alert('请填写设备名称和 ADB 地址')
+      return
+    }
+    onAdd({
+      name: name.trim(),
+      adb_host: adbHost.trim(),
+      adb_port: adbPort,
+      agent_id: selectedAgent || undefined,
+      rsa_key_file: rsaKeyFile || undefined,
+    })
+  }
+
+  const steps: { key: Step; label: string }[] = [
+    { key: 'pair', label: '配对' },
+    { key: 'connect', label: '连接' },
+    { key: 'save', label: '保存' },
+  ]
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative bg-card border border-border rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-blue-500/10 rounded-lg">
+              <Wifi className="w-5 h-5 text-blue-400" />
+            </div>
+            <h2 className="text-lg font-semibold text-gray-100">添加远程设备</h2>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-gray-800 rounded-lg transition-colors">
+            <X className="w-5 h-5 text-gray-400" />
+          </button>
+        </div>
+
+        {/* Step indicator */}
+        <div className="flex items-center px-6 pt-4 pb-2">
+          {steps.map((s, i) => (
+            <div key={s.key} className="flex items-center flex-1">
+              <div className={`flex items-center gap-1.5 text-xs ${step === s.key ? 'text-accent' : steps.indexOf(steps.find(x => x.key === step)!) > i ? 'text-green-400' : 'text-gray-600'}`}>
+                <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${step === s.key ? 'bg-accent text-white' : steps.indexOf(steps.find(x => x.key === step)!) > i ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-500'}`}>
+                  {steps.indexOf(steps.find(x => x.key === step)!) > i ? '✓' : i + 1}
+                </div>
+                <span>{s.label}</span>
+              </div>
+              {i < steps.length - 1 && <div className="flex-1 h-px mx-2 bg-gray-700" />}
+            </div>
+          ))}
+        </div>
+
+        {/* Content */}
+        <div className="px-6 py-4 max-h-[55vh] overflow-y-auto">
+          {/* ========== Step 1: Pair ========== */}
+          {step === 'pair' && (
+            <div className="space-y-4">
+              <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+                <p className="text-sm text-blue-300">
+                  MIUI 无线调试需先配对，再连接。请在手机上开启「无线调试」→「使用配对码配对设备」，获取配对地址和配对码。
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm text-gray-400 mb-1.5">连接方式</label>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setConnectMode('pair')}
+                    className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${connectMode === 'pair' ? 'bg-accent text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                  >
+                    配对码配对
+                  </button>
+                  <button
+                    onClick={() => { setConnectMode('direct'); setStep('connect') }}
+                    className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${connectMode === 'direct' ? 'bg-accent text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                  >
+                    直接连接
+                  </button>
+                </div>
+              </div>
+
+              {connectMode === 'pair' && (
+                <>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <label className="block text-sm text-gray-400 mb-1.5">配对 IP <span className="text-red-400">*</span></label>
+                      <input
+                        type="text"
+                        value={pairHost}
+                        onChange={(e) => setPairHost(e.target.value)}
+                        placeholder="192.168.1.100"
+                        className="w-full px-3 py-2 bg-background-secondary border border-border rounded-lg text-gray-100 placeholder-gray-600 focus:outline-none focus:border-accent"
+                      />
+                    </div>
+                    <div className="w-24">
+                      <label className="block text-sm text-gray-400 mb-1.5">配对端口 <span className="text-red-400">*</span></label>
+                      <input
+                        type="text"
+                        value={pairPort}
+                        onChange={(e) => setPairPort(e.target.value.replace(/\D/g, ''))}
+                        placeholder="37129"
+                        className="w-full px-3 py-2 bg-background-secondary border border-border rounded-lg text-gray-100 placeholder-gray-600 focus:outline-none focus:border-accent"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm text-gray-400 mb-1.5">配对码 <span className="text-red-400">*</span></label>
+                    <input
+                      type="text"
+                      value={pairingCode}
+                      onChange={(e) => setPairingCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      placeholder="6 位数字"
+                      maxLength={6}
+                      className="w-full px-3 py-2 bg-background-secondary border border-border rounded-lg text-gray-100 placeholder-gray-600 focus:outline-none focus:border-accent tracking-widest text-center text-lg font-mono"
+                    />
+                  </div>
+
+                  {pairResult && (
+                    <div className={`flex items-center gap-2 p-3 rounded-lg text-sm ${pairResult.success ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'}`}>
+                      {pairResult.success ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <XCircle className="w-4 h-4 shrink-0" />}
+                      <span>{pairResult.message}</span>
+                    </div>
+                  )}
+
+                  <button
+                    onClick={handlePair}
+                    disabled={isPairing || !pairHost || !pairPort || pairingCode.length < 4}
+                    className="w-full py-2.5 bg-accent hover:bg-accent-hover text-white rounded-lg font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {isPairing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
+                    {isPairing ? '配对中...' : '配对'}
+                  </button>
+
+                  {pairResult?.success && (
+                    <button
+                      onClick={() => setStep('connect')}
+                      className="w-full py-2 bg-green-500/10 border border-green-500/30 text-green-400 rounded-lg font-medium flex items-center justify-center gap-2 hover:bg-green-500/20 transition-colors"
+                    >
+                      配对成功，下一步
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  )}
+                </>
+              )}
+
+              <div>
+                <label className="block text-sm text-gray-400 mb-1.5">Agent（可选）</label>
+                {agents.length === 0 ? (
+                  <p className="text-xs text-gray-600">暂无可用 Agent</p>
+                ) : (
+                  <select
+                    value={selectedAgent}
+                    onChange={(e) => setSelectedAgent(e.target.value)}
+                    className="w-full px-3 py-2 bg-background-secondary border border-border rounded-lg text-gray-100 focus:outline-none focus:border-accent"
+                  >
+                    <option value="">自动选择</option>
+                    {agents.map((a) => (
+                      <option key={a.agent_id} value={a.agent_id}>{a.agent_id}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ========== Step 2: Connect ========== */}
+          {step === 'connect' && (
+            <div className="space-y-4">
+              <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+                <p className="text-sm text-blue-300">
+                  配对成功后，使用无线调试页面显示的「IP 地址和端口」（注意：连接端口与配对端口不同）执行 adb connect。
+                </p>
+              </div>
+
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label className="block text-sm text-gray-400 mb-1.5">连接 IP <span className="text-red-400">*</span></label>
+                  <input
+                    type="text"
+                    value={adbHost}
+                    onChange={(e) => setAdbHost(e.target.value)}
+                    placeholder="192.168.1.100"
+                    className="w-full px-3 py-2 bg-background-secondary border border-border rounded-lg text-gray-100 placeholder-gray-600 focus:outline-none focus:border-accent"
+                  />
+                </div>
+                <div className="w-24">
+                  <label className="block text-sm text-gray-400 mb-1.5">连接端口</label>
+                  <input
+                    type="number"
+                    value={adbPort}
+                    onChange={(e) => setAdbPort(Number(e.target.value))}
+                    className="w-full px-3 py-2 bg-background-secondary border border-border rounded-lg text-gray-100 focus:outline-none focus:border-accent"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm text-gray-400 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5" />
+                  RSA 密钥（可选）
+                </label>
+                <input
+                  type="file"
+                  onChange={(e) => setRsaKeyFile(e.target.files?.[0] || null)}
+                  className="w-full text-sm text-gray-400 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-sm file:bg-background-secondary file:text-gray-300 hover:file:bg-gray-700"
+                />
+                {rsaKeyFile && <p className="text-xs text-gray-500 mt-1">已选择: {rsaKeyFile.name}</p>}
+              </div>
+
+              {connectResult && (
+                <div className={`flex items-center gap-2 p-3 rounded-lg text-sm ${connectResult.success ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'}`}>
+                  {connectResult.success ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <XCircle className="w-4 h-4 shrink-0" />}
+                  <span>{connectResult.message}</span>
+                </div>
+              )}
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setStep('pair')}
+                  className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg font-medium transition-colors flex items-center gap-2"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                  上一步
+                </button>
+                <button
+                  onClick={handleConnect}
+                  disabled={isConnecting || !adbHost}
+                  className="flex-1 py-2.5 bg-accent hover:bg-accent-hover text-white rounded-lg font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {isConnecting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Server className="w-4 h-4" />}
+                  {isConnecting ? '连接中...' : '测试连接'}
+                </button>
+              </div>
+
+              {connectResult?.success && (
+                <button
+                  onClick={() => setStep('save')}
+                  className="w-full py-2 bg-green-500/10 border border-green-500/30 text-green-400 rounded-lg font-medium flex items-center justify-center gap-2 hover:bg-green-500/20 transition-colors"
+                >
+                  连接成功，下一步
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* ========== Step 3: Save ========== */}
+          {step === 'save' && (
+            <div className="space-y-4">
+              <div className="p-3 bg-green-500/10 border border-green-500/20 rounded-lg">
+                <p className="text-sm text-green-300">
+                  连接成功！请为设备命名并保存。
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm text-gray-400 mb-1.5">设备名称 <span className="text-red-400">*</span></label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="如：客厅小米电视"
+                  className="w-full px-3 py-2 bg-background-secondary border border-border rounded-lg text-gray-100 placeholder-gray-600 focus:outline-none focus:border-accent"
+                />
+              </div>
+
+              <div className="p-3 bg-background-secondary rounded-lg space-y-1.5">
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-500">ADB 地址</span>
+                  <span className="text-gray-300 font-mono">{adbHost}:{adbPort}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-500">Agent</span>
+                  <span className="text-gray-300">{selectedAgent || '自动选择'}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-500">RSA 密钥</span>
+                  <span className="text-gray-300">{rsaKeyFile ? rsaKeyFile.name : '无'}</span>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setStep('connect')}
+                  className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg font-medium transition-colors flex items-center gap-2"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                  上一步
+                </button>
+                <button
+                  onClick={handleAdd}
+                  disabled={isAdding || !name.trim()}
+                  className="flex-1 py-2.5 bg-accent hover:bg-accent-hover text-white rounded-lg font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {isAdding ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                  {isAdding ? '保存中...' : '保存设备'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================================
 // Delete Confirmation Modal
 // ============================================================================
 
@@ -470,6 +895,7 @@ function DeleteConfirmModal({
   isOpen,
   containerId,
   containerName,
+  isExternal,
   onClose,
   onConfirm,
   isDeleting,
@@ -477,6 +903,7 @@ function DeleteConfirmModal({
   isOpen: boolean
   containerId: string
   containerName: string
+  isExternal?: boolean
   onClose: () => void
   onConfirm: () => void
   isDeleting: boolean
@@ -485,29 +912,25 @@ function DeleteConfirmModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Backdrop */}
       <div
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
         onClick={onClose}
       />
 
-      {/* Modal */}
       <div className="relative bg-card border border-border rounded-2xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden">
-        {/* Header */}
         <div className="flex items-center gap-3 px-6 py-4 border-b border-border">
           <div className="p-2 bg-red-500/10 rounded-lg">
             <Trash2 className="w-5 h-5 text-red-400" />
           </div>
-          <h2 className="text-lg font-semibold text-gray-100">删除容器</h2>
+          <h2 className="text-lg font-semibold text-gray-100">{isExternal ? '删除外部设备' : '删除容器'}</h2>
         </div>
 
-        {/* Content */}
         <div className="px-6 py-5">
           <p className="text-gray-300">
-            确定要删除容器 <span className="font-medium text-gray-100">{containerName}</span> 吗？
+            确定要{isExternal ? '删除外部设备' : '删除容器'} <span className="font-medium text-gray-100">{containerName}</span> 吗？
           </p>
           <p className="text-sm text-gray-500 mt-2">
-            此操作不可恢复，容器内的所有数据将被永久删除。
+            {isExternal ? '此操作仅移除设备记录，不影响实际设备。' : '此操作不可恢复，容器内的所有数据将被永久删除。'}
           </p>
         </div>
 
@@ -679,7 +1102,9 @@ export default function Dashboard() {
   // Modal 状态
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
   const [isCreateLoading, setIsCreateLoading] = useState(false)
-  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null)
+  const [isExternalDeviceModalOpen, setIsExternalDeviceModalOpen] = useState(false)
+  const [isExternalDeviceLoading, setIsExternalDeviceLoading] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string; source?: string } | null>(null)
   const [isDeleteLoading, setIsDeleteLoading] = useState(false)
   const [resizeTarget, setResizeTarget] = useState<{ id: string; name: string } | null>(null)
   const [isResizeLoading, setIsResizeLoading] = useState(false)
@@ -740,13 +1165,16 @@ export default function Dashboard() {
 
     try {
       setIsDeleteLoading(true)
-      await deleteContainer(deleteTarget.id, true)
+      if (deleteTarget.source === 'external') {
+        await deleteExternalDevice(deleteTarget.id)
+      } else {
+        await deleteContainer(deleteTarget.id, true)
+      }
       setDeleteTarget(null)
-      // 刷新列表
       await fetchInstances()
     } catch (err) {
-      console.error('删除容器失败:', err)
-      alert(err instanceof Error ? err.message : '删除容器失败')
+      console.error('删除失败:', err)
+      alert(err instanceof Error ? err.message : '删除失败')
     } finally {
       setIsDeleteLoading(false)
     }
@@ -772,6 +1200,20 @@ export default function Dashboard() {
       alert(err instanceof Error ? err.message : '修改分辨率失败')
     } finally {
       setIsResizeLoading(false)
+    }
+  }
+
+  const handleAddExternalDevice = async (data: { name: string; adb_host: string; adb_port: number; agent_id?: string; rsa_key_file?: File }) => {
+    try {
+      setIsExternalDeviceLoading(true)
+      await addExternalDevice(data)
+      setIsExternalDeviceModalOpen(false)
+      await fetchInstances()
+    } catch (err) {
+      console.error('添加外部设备失败:', err)
+      alert(err instanceof Error ? err.message : '添加外部设备失败')
+    } finally {
+      setIsExternalDeviceLoading(false)
     }
   }
 
@@ -814,6 +1256,14 @@ export default function Dashboard() {
 
               {/* 创建容器按钮 */}
               <button
+                onClick={() => setIsExternalDeviceModalOpen(true)}
+                className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+              >
+                <Wifi className="w-4 h-4" />
+                <span className="text-sm font-medium hidden sm:inline">添加远程设备</span>
+              </button>
+
+              <button
                 onClick={() => setIsCreateModalOpen(true)}
                 className="flex items-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition-colors"
               >
@@ -845,7 +1295,7 @@ export default function Dashboard() {
         <div className="mb-8">
           <h2 className="text-2xl font-semibold text-gray-100">实例列表</h2>
           <p className="text-sm text-gray-500 mt-1">
-            共 {instances.length} 个容器
+            共 {instances.length} 个实例（{instances.filter(i => i.source === 'external').length} 个远程设备）
           </p>
         </div>
 
@@ -915,8 +1365,8 @@ export default function Dashboard() {
                 key={instance.id}
                 instance={instance}
                 onConnect={handleConnect}
-                onDelete={(id) => {
-                  setDeleteTarget({ id, name: instance.name })
+                onDelete={(id, source) => {
+                  setDeleteTarget({ id, name: instance.name, source })
                 }}
                 onResize={(id) => {
                   setResizeTarget({ id, name: instance.name })
@@ -937,11 +1387,20 @@ export default function Dashboard() {
         agents={agents}
       />
 
+      <AddExternalDeviceModal
+        isOpen={isExternalDeviceModalOpen}
+        onClose={() => setIsExternalDeviceModalOpen(false)}
+        onAdd={handleAddExternalDevice}
+        isAdding={isExternalDeviceLoading}
+        agents={agents}
+      />
+
       {/* 删除确认 Modal */}
       <DeleteConfirmModal
         isOpen={deleteTarget !== null}
         containerId={deleteTarget?.id || ''}
         containerName={deleteTargetInstance?.name || deleteTarget?.name || ''}
+        isExternal={deleteTarget?.source === 'external'}
         onClose={() => setDeleteTarget(null)}
         onConfirm={handleDeleteContainer}
         isDeleting={isDeleteLoading}

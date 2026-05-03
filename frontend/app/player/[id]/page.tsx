@@ -27,8 +27,8 @@ export default function PlayerPage({ params }: PageProps) {
   const [instanceName, setInstanceName] = useState<string>('')
   const [isLoading, setIsLoading] = useState(true)
   const [showApkUploader, setShowApkUploader] = useState(false)
+  const [isExternal, setIsExternal] = useState(false)
 
-  // 获取实例名称用于显示
   useEffect(() => {
     let mounted = true
     
@@ -39,6 +39,7 @@ export default function PlayerPage({ params }: PageProps) {
         const instance = data.instances.find((i) => i.id === id)
         if (instance) {
           setInstanceName(instance.name)
+          setIsExternal(instance.source === 'external')
         }
       } catch (err) {
         console.error('获取实例信息失败:', err)
@@ -64,14 +65,23 @@ export default function PlayerPage({ params }: PageProps) {
     <div className="fixed inset-0 bg-black flex flex-col">
       {/* 顶部导航栏 - 只保留返回按钮，减少视觉干扰 */}
       <header className="absolute top-0 left-0 z-20 p-3 pointer-events-none">
-        {/* 返回按钮 - pointer-events-auto 让按钮可点击 */}
-        <button
-          onClick={handleBack}
-          className="p-2 bg-black/40 hover:bg-black/60 backdrop-blur-sm rounded-full transition-colors pointer-events-auto"
-          title="返回"
-        >
-          <ArrowLeft className="w-5 h-5 text-white" />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleBack}
+            className="p-2 bg-black/40 hover:bg-black/60 backdrop-blur-sm rounded-full transition-colors pointer-events-auto"
+            title="返回"
+          >
+            <ArrowLeft className="w-5 h-5 text-white" />
+          </button>
+          {instanceName && (
+            <div className="px-3 py-1 bg-black/40 backdrop-blur-sm rounded-full pointer-events-none">
+              <span className="text-sm text-gray-300">{instanceName}</span>
+              {isExternal && (
+                <span className="ml-2 px-1.5 py-0.5 text-xs bg-blue-500/30 text-blue-300 rounded">远程</span>
+              )}
+            </div>
+          )}
+        </div>
       </header>
 
       {/* 视频播放器区域 */}
@@ -91,14 +101,16 @@ export default function PlayerPage({ params }: PageProps) {
 
           {/* 右侧工具按钮 */}
           <div className="flex gap-2">
-            <button
-              onClick={() => setShowApkUploader(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-black/40 hover:bg-black/60 backdrop-blur-sm rounded-full transition-colors"
-              title="安装 APK"
-            >
-              <Package className="w-3.5 h-3.5 text-accent" />
-              <span className="text-xs text-white">APK</span>
-            </button>
+            {!isExternal && (
+              <button
+                onClick={() => setShowApkUploader(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-black/40 hover:bg-black/60 backdrop-blur-sm rounded-full transition-colors"
+                title="安装 APK"
+              >
+                <Package className="w-3.5 h-3.5 text-accent" />
+                <span className="text-xs text-white">APK</span>
+              </button>
+            )}
           </div>
         </div>
       </footer>
