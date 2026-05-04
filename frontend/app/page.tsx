@@ -129,7 +129,7 @@ function InstanceCard({
               </span>
             )}
           </div>
-          <p className="text-xs text-gray-500 mt-1 font-mono">
+          <p className="text-xs text-gray-500 mt-1 font-mono truncate" title={instance.id}>
             ID: {instance.id}
           </p>
         </div>
