@@ -200,11 +200,42 @@ class AdbManager:
             HTTPException: Container not found or ADB connection failed
         """
         await self._execute(container_id, f"input keyevent {keycode}")
-    
+
+    async def wake_screen(self, container_id: str) -> None:
+        """
+        Wake up screen and prevent it from sleeping during the session.
+
+        Args:
+            container_id: Docker container ID or name
+
+        Raises:
+            HTTPException: Container not found or ADB connection failed
+        """
+        ext_addr = self._external_addresses.get(container_id)
+        if ext_addr:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "adb", "connect", ext_addr,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=10)
+            except Exception:
+                pass
+        await self._execute(container_id, "input keyevent 224")
+        try:
+            await self._execute(container_id, "svc power stayon true")
+        except Exception:
+            pass
+        try:
+            await self._execute(container_id, "settings put system screen_off_timeout 2147483647")
+        except Exception:
+            pass
+
     # =========================================================================
     # Screen resolution and coordinate conversion
     # =========================================================================
-    
+
     def register_external_device(self, container_id: str, adb_address: str, rsa_key_path: Optional[str] = None) -> None:
         self._external_addresses[container_id] = adb_address
         if rsa_key_path:

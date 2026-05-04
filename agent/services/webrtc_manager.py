@@ -436,6 +436,8 @@ class WebRTCManager:
             
             # Create video track (if not already created for this container)
             if container_id not in self._tracks:
+                if external_adb_address:
+                    await adb_manager.wake_screen(container_id)
                 logger.info("[WebRTC] Creating ScrcpyTrack for container %s (ADB port: %d)...", container_id, adb_port)
                 track = ScrcpyTrack(container_id, adb_port, external_adb_address=external_adb_address)
                 await track._start_scrcpy_async()
