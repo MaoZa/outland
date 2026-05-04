@@ -1,54 +1,56 @@
-name: AI Code Reviewer
+name: AI Code Reviewer (DeepSeek-V4-Flash)
 
 on:
   pull_request:
-    # Trigger when a PR is opened, and re-run when new commits are pushed
     types: [opened, synchronize]
 
 jobs:
   ai-code-review:
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write # Required to post comments on the PR
-      contents: read       # Required to read the repository code
-      models: read         # Required to use GitHub Models
+      pull-requests: write
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # We need the history to compute the diff
+          fetch-depth: 0
 
       - name: Extract PR Diff
         id: get_diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Use GitHub CLI to get the unified diff of the PR
           DIFF=$(gh pr diff ${{ github.event.pull_request.number }})
-          
-          # SAFETY MEASURE: Truncate the diff if it's massively huge 
-          # to prevent hitting the model's max token input limit.
-          # Here we keep the first 12,000 characters.
           TRUNCATED_DIFF="${DIFF:0:12000}"
           
-          # Safely write multiline string to GITHUB_OUTPUT
           EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
           echo "diff<<$EOF" >> $GITHUB_OUTPUT
           echo "$TRUNCATED_DIFF" >> $GITHUB_OUTPUT
           echo "$EOF" >> $GITHUB_OUTPUT
 
-      - name: Run AI Inference (Analyze Code)
-        id: inference
-        uses: actions/ai-inference@v1
+      - name: Code Review & Comment
+        uses: actions/github-script@v7
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'gpt-4o' }}
+          PR_DIFF: ${{ steps.get_diff.outputs.diff }}
         with:
-          model: 'gpt-4o'
-          max-tokens: 2048 # Ensure the AI has enough room to write a thorough review
-          system-prompt: |
-            You are an expert Senior Staff Software Engineer performing a code review.
-            You will be provided with a standard unified Git diff.
+          script: |
+            const apiKey = process.env.OPENAI_API_KEY;
+            const baseUrl = process.env.OPENAI_BASE_URL;
+            const modelName = process.env.AI_MODEL;
+            const diff = process.env.PR_DIFF;
             
-            Your task is to analyze the changes and provide a constructive, senior-level code review.
+            if (!apiKey) {
+              core.setFailed('OPENAI_API_KEY secret is not set.');
+              return;
+            }
+
+            const systemPrompt = `You are an expert Senior Staff Software Engineer performing a code review.
+            You will be provided with a standard unified Git diff.
             
             Focus STRICTLY on:
             1. 🐛 Logic errors, edge cases, or potential bugs.
@@ -56,28 +58,41 @@ jobs:
             3. ⚡ Performance bottlenecks.
             4. 🏗️ Architecture and best practices.
             
-            DO NOT comment on minor stylistic or formatting issues (e.g., missing semicolons, whitespace) — assume linters handle that.
-            If the code looks excellent and has no obvious flaws, explicitly state that it looks good.
-            Format your output using clear Markdown headers and bullet points.
+            Format your output using clear Markdown headers and bullet points. DO NOT comment on minor stylistic or formatting issues.`;
 
-          prompt: |
-            Please review the following git diff:
-            ```diff
-            ${{ steps.get_diff.outputs.diff }}
-            ```
+            const userPrompt = `Please review the following git diff:\n\`\`\`diff\n${diff}\n\`\`\``;
 
-      - name: Post Review as PR Comment
-        uses: actions/github-script@v7
-        env:
-          AI_RESPONSE: ${{ steps.inference.outputs.response }}
-        with:
-          script: |
-            const aiResponse = process.env.AI_RESPONSE;
-            const reviewComment = {
+            console.log(`Sending request to ${baseUrl}/chat/completions using model ${modelName}...`);
+
+            const response = await fetch(`${baseUrl}/chat/completions`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+              },
+              body: JSON.stringify({
+                model: modelName,
+                messages: [
+                  { role: 'system', content: systemPrompt },
+                  { role: 'user', content: userPrompt }
+                ],
+                max_tokens: 2048,
+                temperature: 0.2
+              })
+            });
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              core.setFailed(`API Request failed with status ${response.status}: ${errorText}`);
+              return;
+            }
+
+            const data = await response.json();
+            const aiResponse = data.choices[0].message.content;
+
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              // Note: In the GitHub API, PRs are treated as Issues for standard comments
-              issue_number: context.issue.number, 
-              body: `🤖 **AI Code Review (Powered by GitHub Models)**\n\n${aiResponse}`
-            };
-            await github.rest.issues.createComment(reviewComment);
+              issue_number: context.issue.number,
+              body: `🤖 **AI Code Review (${modelName})**\n\n${aiResponse}`
+            });
