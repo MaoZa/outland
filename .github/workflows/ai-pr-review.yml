@@ -2,7 +2,7 @@ name: AI Code Reviewer (DeepSeek-V4-Flash)
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 jobs:
   ai-code-review:
