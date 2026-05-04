@@ -1,4 +1,4 @@
-name: AI Issue Analyzer (Custom API)
+name: AI Issue Analyzer (DeepSeek-V4-Flash)
 
 on:
   issues:
