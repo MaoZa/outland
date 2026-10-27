@@ -1,5 +1,8 @@
 # Outland 安卓云容器平台
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+
 > 面向自托管 Android 13 云游戏串流与自动化控制的开源平台。基于 Redroid 在 Docker 中运行完整 Android 系统，通过 WebRTC 实现低延迟实时视频流与远程控制。
 
 ---
@@ -683,3 +686,9 @@ XAPK 安装有 3 种策略：先装 shared libs、先装非 libs、全量一起�
 - [Next.js 文档](https://nextjs.org/docs)
 - [PyAV 文档](https://pyav.org/docs/stable/)
 - [SQLAlchemy 异步文档](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html)
+
+---
+
+## 10. 开源协议
+
+本项目基于 [MIT 协议](LICENSE) 开源。

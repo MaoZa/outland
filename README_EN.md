@@ -1,5 +1,8 @@
 # Outland - Android Cloud Container Platform
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+
 > An open-source platform for self-hosted Android 13 cloud gaming streaming and automation control. Runs full Android systems in Docker via Redroid, with WebRTC-based low-latency real-time video streaming and remote control.
 
 ---
@@ -683,3 +686,9 @@ XAPK installation has 3 strategies: install shared libs first / install all toge
 - [Next.js Documentation](https://nextjs.org/docs)
 - [PyAV Documentation](https://pyav.org/docs/stable/)
 - [SQLAlchemy Async Documentation](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html)
+
+---
+
+## 10. License
+
+This project is licensed under the [MIT License](LICENSE).

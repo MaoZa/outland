@@ -118,3 +118,4 @@ backend/*.pyo
 /frontend/.next/
 /backend-data/
 backend-data/
+*.tsbuildinfo
